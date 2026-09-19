@@ -42,7 +42,7 @@ import os
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
-
+from zoneinfo import ZoneInfo
 import qrcode
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
@@ -434,10 +434,9 @@ def export_csv(session_id: int, request: Request):
 
     lines = ["codigo,nombre,hora,metodo,donde_se_registro"]
     for r in rows:
-        # TODO (your task): r['timestamp'] is stored in UTC.
-        # The conversion to Bogota time goes here, right before writing the
-        # line. Storing UTC is correct; displaying UTC is not.
-        hora = r["timestamp"]
+        # Stored in UTC, shown in Bogota time. Storing UTC is correct;
+        # displaying it is not.
+        hora = datetime.fromisoformat(r["timestamp"]).astimezone(ZoneInfo("America/Bogota")).strftime("%Y-%m-%d %H:%M")
         lines.append(
             f"{r['student_code']},{r['name']},{hora},{r['method']},{r['registered_where'] or ''}"
         )
