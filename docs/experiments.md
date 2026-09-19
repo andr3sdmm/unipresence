@@ -11,4 +11,3 @@ escaneándolo por ngrok.
 **Qué falló:** escaneé un QR que cambiaba cada 10 segundos. Este QR me pidió mi código personal,sin embargo mientras lo escribía el QR expiró y me tocó volver a repetir el proceso.
 
 **Qué decidí:** separar el registro del check-in.
-
