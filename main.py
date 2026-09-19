@@ -1,28 +1,42 @@
 """
-UniPresence - Verificacion de presencia fisica en aulas grandes
-MVP dia 2b: lista de curso + codigos asignados
+UniPresence - Privacy-preserving physical presence verification for large classrooms
+MVP day 2c: teacher authentication
 
-CAMBIO respecto a la version anterior:
-Antes, cualquiera podia registrarse con cualquier codigo. Eso permitia
-tomar el codigo de un companero y bloquearlo.
+WHAT CHANGED FROM 2b:
 
-Ahora el codigo es un SECRETO que la profesora le asigna a cada estudiante
-y le entrega en privado. El registro pide el codigo primero; si existe y
-nadie lo ha usado, el sistema muestra el nombre para confirmar.
+Two endpoints were open to anyone on the internet:
 
-Asi la lista de nombres nunca queda expuesta en una pagina publica, que
-seria contradictorio en un sistema que se llama privacy-preserving.
+  /                 the teacher screen. Anyone with the link could start a
+                    session, manually mark students present, and download the
+                    CSV with every student name. Found while writing the
+                    threat model.
 
-Propiedad util: si alguien roba un codigo y se registra, el dueno real
-se da cuenta de inmediato porque ya no puede registrarse. El ataque no
-pasa desapercibido.
+  /qr/{session_id}  the attendance QR image. This one is worse. It returns a
+                    freshly minted, currently valid nonce. A registered
+                    student could request it from home, read the nonce and
+                    check in without ever seeing the projector. Session ids
+                    are small integers, so they are trivial to guess.
+                    That breaks presence verification entirely.
 
-Como correrlo:
+Both now require a teacher session. The QR exists only on the projector again.
+
+WHAT THIS DOES NOT SOLVE:
+A single shared password means everyone who knows it has full access and
+there is no record of who did what. The correct fix is institutional login
+(each professor already has a university account). That is out of scope for
+this prototype and is documented as an open risk.
+
+HOW TO RUN:
     source venv/bin/activate
-    uvicorn main:app --reload
+    TEACHER_PASSWORD=your-password uvicorn main:app --reload
+
+The app refuses to serve teacher pages if TEACHER_PASSWORD is not set.
+Failing closed is deliberate: a missing password must not silently mean
+"no password".
 """
 
 import csv
+import hmac
 import io
 import os
 import secrets
@@ -31,40 +45,49 @@ from datetime import datetime, timedelta, timezone
 
 import qrcode
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
 
 # ---------------------------------------------------------------
-# CONFIGURACION
+# CONFIGURATION
 # ---------------------------------------------------------------
 
 DB_PATH = "unipresence.db"
 ROSTER_PATH = "roster.csv"
 
-# Cuantos segundos vive cada QR de asistencia antes de expirar.
-# Decision de diseno: mas corto = mas dificil reenviar por WhatsApp;
-# mas largo = mas comodo para quien esta al fondo del salon.
-NONCE_SEGUNDOS = 10
+# How long each attendance QR stays valid.
+# Design decision: shorter makes relaying over WhatsApp harder; longer is
+# easier for someone sitting at the back of a large lecture hall.
+NONCE_SECONDS = 10
+
+# Read from the environment, never hardcoded. This repository is public:
+# a password written in the source is a password everyone has.
+TEACHER_PASSWORD = os.environ.get("TEACHER_PASSWORD", "")
+
+# Valid teacher session tokens, kept in memory.
+# Restarting the server logs the teacher out, which is acceptable here.
+# Tokens are random, so they reveal nothing about the password.
+TEACHER_SESSIONS = set()
 
 app = FastAPI(title="UniPresence")
 
 
 # ---------------------------------------------------------------
-# BASE DE DATOS
+# DATABASE
 # ---------------------------------------------------------------
 
-def conectar():
+def connect():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def iniciar_db():
-    conn = conectar()
+def init_db():
+    conn = connect()
     c = conn.cursor()
 
-    # Los estudiantes ahora vienen de la lista del curso, no se crean solos.
-    # device_id queda en NULL hasta que la persona registra su telefono.
-    # SQLite permite varios NULL en una columna UNIQUE, asi que esto funciona.
+    # Students come from the course roster; they are not created on the fly.
+    # device_id stays NULL until the person registers their phone.
+    # SQLite allows several NULLs in a UNIQUE column, so this works.
     c.execute("""
         CREATE TABLE IF NOT EXISTS students (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,47 +135,62 @@ def iniciar_db():
     conn.close()
 
 
-def cargar_lista():
+def load_roster():
     """
-    Lee roster.csv y mete los estudiantes que falten.
+    Read roster.csv and insert any students that are missing.
 
-    INSERT OR IGNORE quiere decir: si el codigo ya existe, no hace nada.
-    Asi se puede reiniciar el servidor sin borrar registros existentes,
-    y se pueden agregar estudiantes nuevos al archivo sin romper nada.
+    INSERT OR IGNORE means: if the code already exists, do nothing. The
+    server can restart without wiping existing registrations, and new
+    students can be appended to the file without breaking anything.
     """
     if not os.path.exists(ROSTER_PATH):
-        print(f"AVISO: no se encontro {ROSTER_PATH}. No hay lista de curso.")
+        print(f"WARNING: {ROSTER_PATH} not found. No course roster loaded.")
         return
 
-    conn = conectar()
-    nuevos = 0
+    conn = connect()
+    added = 0
     with open(ROSTER_PATH, encoding="utf-8") as f:
-        for fila in csv.DictReader(f):
-            codigo = (fila.get("codigo") or "").strip()
-            nombre = (fila.get("nombre") or "").strip()
-            if not codigo or not nombre:
+        for row in csv.DictReader(f):
+            code = (row.get("codigo") or "").strip()
+            name = (row.get("nombre") or "").strip()
+            if not code or not name:
                 continue
             cur = conn.execute(
                 "INSERT OR IGNORE INTO students (student_code, name) VALUES (?, ?)",
-                (codigo, nombre),
+                (code, name),
             )
-            nuevos += cur.rowcount
+            added += cur.rowcount
     conn.commit()
     conn.close()
-    print(f"Lista de curso cargada. Estudiantes nuevos: {nuevos}")
+    print(f"Course roster loaded. New students: {added}")
 
 
 @app.on_event("startup")
-def al_arrancar():
-    iniciar_db()
-    cargar_lista()
+def on_startup():
+    init_db()
+    load_roster()
+    if not TEACHER_PASSWORD:
+        print("WARNING: TEACHER_PASSWORD is not set. Teacher pages are disabled.")
 
 
-def ahora():
+def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def envolver(cuerpo: str) -> str:
+# ---------------------------------------------------------------
+# TEACHER AUTHENTICATION
+#
+# Student-facing pages stay open: a student has no account and must be able
+# to register and check in with nothing but a phone. Everything the teacher
+# touches is behind this gate.
+# ---------------------------------------------------------------
+
+def is_teacher(request: Request) -> bool:
+    token = request.cookies.get("teacher_session")
+    return bool(token) and token in TEACHER_SESSIONS
+
+
+def wrap(body: str) -> str:
     return f"""
 <!DOCTYPE html>
 <html lang="es">
@@ -168,18 +206,64 @@ def envolver(cuerpo: str) -> str:
   button.gris {{ background: #666; }}
   a.boton {{ display: block; background: #1a7f37; color: white; padding: 16px;
              text-decoration: none; border-radius: 8px; margin-top: 16px; font-size: 20px; }}
+  form {{ max-width: 420px; margin: 0 auto; }}
 </style>
 </head>
-<body>{cuerpo}</body>
+<body>{body}</body>
 </html>
 """
 
 
+@app.get("/login", response_class=HTMLResponse)
+def login_page(error: str = ""):
+    if not TEACHER_PASSWORD:
+        return wrap(
+            "<p class='error'>Configuracion incompleta</p>"
+            "<p>El servidor no tiene contrasena configurada.</p>"
+        )
+    aviso = "<p class='error'>Contrasena incorrecta</p>" if error else ""
+    return wrap(f"""
+        {aviso}
+        <h2>UniPresence</h2>
+        <p>Pantalla del profesor</p>
+        <form method="post" action="/login">
+          <input type="password" name="password" placeholder="Contrasena" required autofocus>
+          <button type="submit">Entrar</button>
+        </form>
+    """)
+
+
+@app.post("/login")
+def do_login(password: str = Form(...)):
+    # compare_digest instead of == : it takes the same time whether the
+    # first character is wrong or only the last one, so an attacker cannot
+    # guess the password one character at a time by measuring responses.
+    if not TEACHER_PASSWORD or not hmac.compare_digest(password, TEACHER_PASSWORD):
+        return RedirectResponse("/login?error=1", status_code=303)
+
+    token = secrets.token_urlsafe(32)
+    TEACHER_SESSIONS.add(token)
+
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie("teacher_session", token, max_age=43200,
+                        httponly=True, samesite="lax")
+    return response
+
+
+@app.get("/logout")
+def logout(request: Request):
+    token = request.cookies.get("teacher_session")
+    TEACHER_SESSIONS.discard(token)
+    response = RedirectResponse("/login", status_code=303)
+    response.delete_cookie("teacher_session")
+    return response
+
+
 # ---------------------------------------------------------------
-# PANTALLA DEL PROFESOR
+# TEACHER SCREEN
 # ---------------------------------------------------------------
 
-PAGINA_PROFESOR = """
+TEACHER_PAGE = """
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -193,9 +277,11 @@ PAGINA_PROFESOR = """
     .fila { display: flex; justify-content: center; gap: 40px; align-items: flex-start; }
     .panel { text-align: center; }
     h3 { color: #555; font-weight: normal; }
+    .salir { position: absolute; top: 16px; right: 24px; font-size: 14px; color: #888; }
   </style>
 </head>
 <body>
+  <a class="salir" href="/logout">Salir</a>
   <h1>UniPresence</h1>
 
   <div id="antes">
@@ -236,9 +322,9 @@ async function iniciar() {
   refrescarQR();
   refrescarContador();
 
-  // El ?t= obliga al navegador a pedir la imagen de nuevo
-  // en vez de reusar la que tiene en cache.
-  setInterval(refrescarQR, SEGUNDOS * 1000);
+  // The ?t= forces the browser to fetch the image again instead of
+  // reusing the cached one.
+  setInterval(refrescarQR, SECONDS * 1000);
   setInterval(refrescarContador, 3000);
 }
 
@@ -275,14 +361,18 @@ function exportar() {
 
 
 @app.get("/", response_class=HTMLResponse)
-def pantalla_profesor():
-    return PAGINA_PROFESOR.replace("SEGUNDOS", str(NONCE_SEGUNDOS))
+def teacher_screen(request: Request):
+    if not is_teacher(request):
+        return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(TEACHER_PAGE.replace("SECONDS", str(NONCE_SECONDS)))
 
 
 @app.get("/qr-registro-pagina", response_class=HTMLResponse)
-def pagina_qr_registro():
-    """Pantalla para proyectar al inicio de la primera clase."""
-    return envolver("""
+def registration_qr_page(request: Request):
+    """Screen to project at the start of the first class."""
+    if not is_teacher(request):
+        return RedirectResponse("/login", status_code=303)
+    return wrap("""
         <h1>Registro UniPresence</h1>
         <p>Escanea una sola vez. Necesitas el codigo que te entregaron.</p>
         <p>Esto no marca asistencia.</p>
@@ -292,16 +382,19 @@ def pagina_qr_registro():
 
 
 # ---------------------------------------------------------------
-# SESIONES
+# SESSIONS  (teacher only)
 # ---------------------------------------------------------------
 
 @app.post("/session/start")
-def iniciar_sesion(course_name: str = "Genetica"):
-    conn = conectar()
+def start_session(request: Request, course_name: str = "Genetica"):
+    if not is_teacher(request):
+        return Response(status_code=401)
+
+    conn = connect()
     c = conn.cursor()
     c.execute(
         "INSERT INTO sessions (course_name, started_at, active) VALUES (?, ?, 1)",
-        (course_name, ahora()),
+        (course_name, now()),
     )
     conn.commit()
     session_id = c.lastrowid
@@ -310,21 +403,27 @@ def iniciar_sesion(course_name: str = "Genetica"):
 
 
 @app.get("/session/{session_id}/count")
-def contar(session_id: int):
-    conn = conectar()
-    presentes = conn.execute(
+def session_count(session_id: int, request: Request):
+    if not is_teacher(request):
+        return Response(status_code=401)
+
+    conn = connect()
+    present = conn.execute(
         "SELECT COUNT(*) AS n FROM attendance WHERE session_id = ?", (session_id,)
     ).fetchone()["n"]
     total = conn.execute("SELECT COUNT(*) AS n FROM students").fetchone()["n"]
     conn.close()
-    return {"count": presentes, "total": total}
+    return {"count": present, "total": total}
 
 
 @app.get("/session/{session_id}/csv")
-def exportar_csv(session_id: int):
-    """Descarga la lista de asistencia. Lo primero que quiere ver un profesor."""
-    conn = conectar()
-    filas = conn.execute("""
+def export_csv(session_id: int, request: Request):
+    """Download the attendance list. The first thing a professor wants to see."""
+    if not is_teacher(request):
+        return Response(status_code=401)
+
+    conn = connect()
+    rows = conn.execute("""
         SELECT s.student_code, s.name, a.timestamp, a.method, s.registered_where
         FROM attendance a
         JOIN students s ON s.id = a.student_id
@@ -333,29 +432,29 @@ def exportar_csv(session_id: int):
     """, (session_id,)).fetchall()
     conn.close()
 
-    lineas = ["codigo,nombre,hora,metodo,donde_se_registro"]
-    for f in filas:
-        # TODO (tarea tuya): f['timestamp'] esta en UTC.
-        # Aqui es donde va la conversion a hora de Bogota, justo antes de
-        # escribir la linea. Guardar en UTC esta bien; mostrarlo en UTC no.
-        hora = f["timestamp"]
-        lineas.append(
-            f"{f['student_code']},{f['name']},{hora},{f['method']},{f['registered_where'] or ''}"
+    lines = ["codigo,nombre,hora,metodo,donde_se_registro"]
+    for r in rows:
+        # TODO (your task): r['timestamp'] is stored in UTC.
+        # The conversion to Bogota time goes here, right before writing the
+        # line. Storing UTC is correct; displaying UTC is not.
+        hora = r["timestamp"]
+        lines.append(
+            f"{r['student_code']},{r['name']},{hora},{r['method']},{r['registered_where'] or ''}"
         )
-    texto = "\n".join(lineas)
+    text = "\n".join(lines)
 
     return StreamingResponse(
-        io.BytesIO(texto.encode("utf-8")),
+        io.BytesIO(text.encode("utf-8")),
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=asistencia_{session_id}.csv"},
     )
 
 
 # ---------------------------------------------------------------
-# QR
+# QR CODES
 # ---------------------------------------------------------------
 
-def png_de_qr(url: str) -> StreamingResponse:
+def qr_png(url: str) -> StreamingResponse:
     img = qrcode.make(url)
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
@@ -365,53 +464,64 @@ def png_de_qr(url: str) -> StreamingResponse:
 
 
 @app.get("/qr/{session_id}")
-def generar_qr(session_id: int, request: Request):
+def attendance_qr(session_id: int, request: Request):
     """
-    Crea un nonce nuevo y devuelve el PNG del QR de asistencia.
+    Mint a new nonce and return the attendance QR as a PNG.
 
-    El QR no contiene un codigo: contiene una URL completa. Asi la camara
-    nativa del celular la lee y ofrece abrirla, sin necesidad de programar
-    un lector de QR ni pedir permiso de camara.
+    TEACHER ONLY, and this is the important part. This endpoint hands out a
+    currently valid nonce. While it was public, a registered student could
+    request it from anywhere and check in without being in the room, which
+    defeats the entire point of the system. Session ids are small integers
+    and easy to guess, so obscurity was no protection at all.
+
+    Behind the gate, the QR only exists where the teacher projects it.
+
+    Note on design: the QR carries a full URL rather than a bare code, so the
+    phone's built-in camera opens it directly. No QR reader to write, no
+    camera permission to request, and it works the same on iOS and Android.
     """
+    if not is_teacher(request):
+        return Response(status_code=401)
+
     nonce = secrets.token_hex(8)
-    creado = datetime.now(timezone.utc)
-    expira = creado + timedelta(seconds=NONCE_SEGUNDOS)
+    created = datetime.now(timezone.utc)
+    expires = created + timedelta(seconds=NONCE_SECONDS)
 
-    conn = conectar()
+    conn = connect()
     conn.execute(
         "INSERT INTO nonces (nonce, session_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
-        (nonce, session_id, creado.isoformat(), expira.isoformat()),
+        (nonce, session_id, created.isoformat(), expires.isoformat()),
     )
     conn.commit()
     conn.close()
 
     base = str(request.base_url).rstrip("/")
-    return png_de_qr(f"{base}/checkin?s={session_id}&n={nonce}")
+    return qr_png(f"{base}/checkin?s={session_id}&n={nonce}")
 
 
 @app.get("/qr-registro")
-def generar_qr_registro(request: Request):
+def registration_qr(request: Request):
     """
-    QR FIJO de registro. No rota, no expira, no lleva nonce.
+    Fixed registration QR. It does not rotate, expire or carry a nonce.
 
-    Es seguro que sea fijo porque este QR no da acceso a nada: solo abre
-    la pagina donde hay que escribir el codigo asignado. Sin ese codigo
-    no se puede registrar nadie.
+    Leaving this one public is safe: it encodes nothing but the address of
+    the registration page. Without an assigned code, that page grants
+    nothing.
     """
     base = str(request.base_url).rstrip("/")
-    return png_de_qr(f"{base}/registro")
+    return qr_png(f"{base}/registro")
 
 
 # ---------------------------------------------------------------
-# REGISTRO EN DOS PASOS
-#   paso 1: escribir el codigo asignado
-#   paso 2: confirmar que el nombre es el correcto
+# REGISTRATION, IN TWO STEPS  (open to students)
+#   step 1: type the assigned code
+#   step 2: confirm the name is right
 #
-# El orden importa: pedir el codigo PRIMERO evita publicar la lista
-# completa del curso en una pagina abierta a internet.
+# Order matters: asking for the code FIRST avoids publishing the whole
+# course roster on a page open to the internet.
 # ---------------------------------------------------------------
 
-FORMULARIO_CODIGO = """
+CODE_FORM = """
     <h2>Registro</h2>
     <p>Escribe el codigo que te entregaron. Se hace una sola vez
     y no marca asistencia.</p>
@@ -423,79 +533,79 @@ FORMULARIO_CODIGO = """
 
 
 @app.get("/registro", response_class=HTMLResponse)
-def pagina_registro(request: Request):
+def registration_page(request: Request):
     device_id = request.cookies.get("device_id")
 
     if device_id:
-        conn = conectar()
-        estudiante = conn.execute(
+        conn = connect()
+        student = conn.execute(
             "SELECT * FROM students WHERE device_id = ?", (device_id,)
         ).fetchone()
         conn.close()
-        if estudiante:
-            return envolver(
+        if student:
+            return wrap(
                 f"<p class='ok'>Ya estas registrado</p>"
-                f"<div class='nombre'>{estudiante['name']}</div>"
+                f"<div class='nombre'>{student['name']}</div>"
                 f"<p>En clase solo escanea el QR de asistencia.</p>"
             )
 
-    respuesta = HTMLResponse(envolver(FORMULARIO_CODIGO))
+    response = HTMLResponse(wrap(CODE_FORM))
     if not device_id:
-        nuevo = secrets.token_hex(16)
-        respuesta.set_cookie("device_id", nuevo, max_age=31536000,
-                             httponly=True, samesite="lax")
-    return respuesta
+        new_id = secrets.token_hex(16)
+        response.set_cookie("device_id", new_id, max_age=31536000,
+                            httponly=True, samesite="lax")
+    return response
 
 
 @app.post("/registro", response_class=HTMLResponse)
-def paso1_verificar_codigo(request: Request, student_code: str = Form(...)):
-    """Paso 1: el codigo existe y esta libre? Si si, mostramos el nombre."""
+def step1_check_code(request: Request, student_code: str = Form(...)):
+    """Step 1: does the code exist and is it unclaimed? If so, show the name."""
     device_id = request.cookies.get("device_id")
     if not device_id:
-        return envolver("<p class='error'>No se pudo identificar el dispositivo. "
-                        "Recarga la pagina e intenta de nuevo.</p>")
+        return wrap("<p class='error'>No se pudo identificar el dispositivo. "
+                    "Recarga la pagina e intenta de nuevo.</p>")
 
-    codigo = student_code.strip().upper()
+    code = student_code.strip().upper()
 
-    conn = conectar()
-    estudiante = conn.execute(
-        "SELECT * FROM students WHERE UPPER(student_code) = ?", (codigo,)
+    conn = connect()
+    student = conn.execute(
+        "SELECT * FROM students WHERE UPPER(student_code) = ?", (code,)
     ).fetchone()
 
-    # Este telefono ya pertenece a otra persona.
-    ya_tiene = conn.execute(
+    # This phone already belongs to someone else.
+    already = conn.execute(
         "SELECT * FROM students WHERE device_id = ?", (device_id,)
     ).fetchone()
     conn.close()
 
-    if ya_tiene:
-        return envolver(
+    if already:
+        return wrap(
             f"<p class='error'>Este telefono ya esta registrado</p>"
-            f"<div class='nombre'>{ya_tiene['name']}</div>"
+            f"<div class='nombre'>{already['name']}</div>"
             f"<p>Un telefono solo puede pertenecer a un estudiante.</p>"
         )
 
-    if estudiante is None:
-        return envolver(
+    if student is None:
+        return wrap(
             "<p class='error'>Ese codigo no existe</p>"
             "<p>Revisa que este bien escrito. Si sigue sin funcionar, "
             "avisale a la profesora.</p>"
-            + FORMULARIO_CODIGO
+            + CODE_FORM
         )
 
-    if estudiante["device_id"]:
-        # Alguien ya uso ese codigo. Si no fuiste tu, es un problema serio
-        # y hay que reportarlo: significa que el codigo se filtro.
-        return envolver(
+    if student["device_id"]:
+        # Someone already used that code. If it was not you, the code leaked
+        # and that needs reporting. This is what makes the attack visible.
+        return wrap(
             "<p class='error'>Ese codigo ya fue usado</p>"
             "<p>Si tu no lo registraste, avisale a la profesora de inmediato.</p>"
         )
 
-    return envolver(f"""
+    return wrap(f"""
         <h2>Confirma</h2>
-        <div class="nombre">{estudiante['name']}</div>
+        <div class="nombre">{student['name']}</div>
         <form method="post" action="/registro/confirmar">
-          <input type="hidden" name="student_code" value="{estudiante['student_code']}">
+          <input type="hidden" name="student_code" value="{student['student_code']}">
           <button type="submit">Si, soy yo</button>
         </form>
         <form method="get" action="/registro">
@@ -505,60 +615,60 @@ def paso1_verificar_codigo(request: Request, student_code: str = Form(...)):
 
 
 @app.post("/registro/confirmar", response_class=HTMLResponse)
-def paso2_confirmar(request: Request, student_code: str = Form(...)):
-    """Paso 2: amarrar este telefono a ese estudiante."""
+def step2_confirm(request: Request, student_code: str = Form(...)):
+    """Step 2: bind this phone to that student."""
     device_id = request.cookies.get("device_id")
     if not device_id:
-        return envolver("<p class='error'>No se pudo identificar el dispositivo.</p>")
+        return wrap("<p class='error'>No se pudo identificar el dispositivo.</p>")
 
-    codigo = student_code.strip().upper()
+    code = student_code.strip().upper()
 
-    conn = conectar()
-    activa = conn.execute(
+    conn = connect()
+    active = conn.execute(
         "SELECT id FROM sessions WHERE active = 1 ORDER BY id DESC LIMIT 1"
     ).fetchone()
-    donde = "aula" if activa else "pre"
+    where = "aula" if active else "pre"
 
-    # El WHERE device_id IS NULL es la proteccion contra dos personas
-    # confirmando el mismo codigo al mismo tiempo: solo la primera escribe.
+    # WHERE device_id IS NULL is what protects against two people confirming
+    # the same code at the same moment: only the first write succeeds.
     cur = conn.execute(
         "UPDATE students SET device_id = ?, registered_at = ?, registered_where = ? "
         "WHERE UPPER(student_code) = ? AND device_id IS NULL",
-        (device_id, ahora(), donde, codigo),
+        (device_id, now(), where, code),
     )
     conn.commit()
 
     if cur.rowcount == 0:
         conn.close()
-        return envolver("<p class='error'>Ese codigo ya fue usado</p>"
-                        "<p>Avisale a la profesora.</p>")
+        return wrap("<p class='error'>Ese codigo ya fue usado</p>"
+                    "<p>Avisale a la profesora.</p>")
 
-    estudiante = conn.execute(
+    student = conn.execute(
         "SELECT * FROM students WHERE device_id = ?", (device_id,)
     ).fetchone()
     conn.close()
 
-    return envolver(
+    return wrap(
         f"<p class='ok'>Telefono registrado</p>"
-        f"<div class='nombre'>{estudiante['name']}</div>"
+        f"<div class='nombre'>{student['name']}</div>"
         f"<p>En clase, apunta la camara al QR de la pantalla. "
         f"No vas a tener que escribir nada.</p>"
     )
 
 
 # ---------------------------------------------------------------
-# CHECK-IN (rapido, sin escribir)
+# CHECK-IN  (open to students, fast, no typing)
 # ---------------------------------------------------------------
 
-def validar_nonce(conn, session_id: int, nonce: str):
-    fila = conn.execute(
+def check_nonce(conn, session_id: int, nonce: str):
+    row = conn.execute(
         "SELECT * FROM nonces WHERE nonce = ? AND session_id = ?", (nonce, session_id)
     ).fetchone()
 
-    if fila is None:
+    if row is None:
         return False, "Codigo invalido."
 
-    if datetime.now(timezone.utc) > datetime.fromisoformat(fila["expires_at"]):
+    if datetime.now(timezone.utc) > datetime.fromisoformat(row["expires_at"]):
         return False, "Este codigo ya expiro. Escanea el QR actual de la pantalla."
 
     return True, ""
@@ -568,18 +678,18 @@ def validar_nonce(conn, session_id: int, nonce: str):
 def checkin(s: int, n: str, request: Request):
     device_id = request.cookies.get("device_id")
 
-    conn = conectar()
-    estudiante = None
+    conn = connect()
+    student = None
     if device_id:
-        estudiante = conn.execute(
+        student = conn.execute(
             "SELECT * FROM students WHERE device_id = ?", (device_id,)
         ).fetchone()
 
-    # Telefono sin registrar: no le pedimos el codigo aqui, porque escribirlo
-    # toma mas de los 10 segundos que dura el nonce. Lo mandamos a registrarse.
-    if estudiante is None:
+    # Unregistered phone: we do not ask for the code here, because typing it
+    # takes longer than the 10 seconds the nonce lasts. Send them to register.
+    if student is None:
         conn.close()
-        return envolver("""
+        return wrap("""
             <h2>Primero registrate</h2>
             <p>Este telefono todavia no esta asociado a ningun estudiante.</p>
             <a class="boton" href="/registro">Registrarme ahora</a>
@@ -587,49 +697,54 @@ def checkin(s: int, n: str, request: Request):
             entregaron. Despues de registrarte, vuelve a escanear el QR.</p>
         """)
 
-    valido, motivo = validar_nonce(conn, s, n)
-    if not valido:
+    valid, reason = check_nonce(conn, s, n)
+    if not valid:
         conn.close()
-        return envolver(f"<p class='error'>{motivo}</p>")
+        return wrap(f"<p class='error'>{reason}</p>")
 
-    mensaje = registrar_asistencia(conn, s, estudiante["id"], n, "qr")
+    message = record_attendance(conn, s, student["id"], n, "qr")
     conn.close()
-    return envolver(f"{mensaje}<div class='nombre'>{estudiante['name']}</div>")
+    return wrap(f"{message}<div class='nombre'>{student['name']}</div>")
 
 
 @app.post("/manual")
-def agregar_manual(student_code: str = Form(...), session_id: int = Form(...)):
+def manual_override(request: Request,
+                    student_code: str = Form(...),
+                    session_id: int = Form(...)):
     """
-    Anulacion manual del profesor: para el estudiante sin bateria, sin datos,
-    o que nunca registro su telefono.
+    Teacher override: for the student with a dead battery, no data, or who
+    never registered a phone.
 
-    Con la lista de curso esto ahora funciona para cualquiera que este en
-    la lista, este o no registrado su telefono. Antes no se podia.
+    With the roster loaded this works for anyone on the list, registered or
+    not. Before the roster existed it did not.
     """
-    conn = conectar()
-    estudiante = conn.execute(
+    if not is_teacher(request):
+        return Response(status_code=401)
+
+    conn = connect()
+    student = conn.execute(
         "SELECT * FROM students WHERE UPPER(student_code) = ?",
         (student_code.strip().upper(),),
     ).fetchone()
 
-    if estudiante is None:
+    if student is None:
         conn.close()
         return {"mensaje": "Ese codigo no esta en la lista del curso."}
 
-    mensaje = registrar_asistencia(conn, session_id, estudiante["id"], None, "manual")
+    message = record_attendance(conn, session_id, student["id"], None, "manual")
     conn.close()
-    nombre = estudiante["name"]
-    return {"mensaje": f"{nombre}: agregado." if "registrada" in mensaje
-            else f"{nombre}: ya estaba."}
+    name = student["name"]
+    return {"mensaje": f"{name}: agregado." if "registrada" in message
+            else f"{name}: ya estaba."}
 
 
-def registrar_asistencia(conn, session_id: int, student_id: int,
-                         nonce: str | None, method: str) -> str:
+def record_attendance(conn, session_id: int, student_id: int,
+                      nonce: str | None, method: str) -> str:
     try:
         conn.execute(
             "INSERT INTO attendance (session_id, student_id, timestamp, method, nonce_used) "
             "VALUES (?, ?, ?, ?, ?)",
-            (session_id, student_id, ahora(), method, nonce),
+            (session_id, student_id, now(), method, nonce),
         )
         conn.commit()
         return "<p class='ok'>Asistencia registrada</p>"
