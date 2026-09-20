@@ -1,23 +1,28 @@
 """
 UniPresence - Privacy-preserving physical presence verification for large classrooms
-MVP day 2d: code fully in English
+MVP day 2e: ending a session, and getting the data back
 
-WHAT CHANGED FROM 2c:
-Only naming. No behaviour changed.
+WHAT CHANGED FROM 2d:
 
-Python comments were already in English. This pass renames the JavaScript
-variables and functions, the HTML element ids, the CSS class names, the JSON
-keys and the URL paths, so the whole codebase reads in one language.
+Two gaps that would only have shown up on the day of the real classroom test.
 
-Everything a student or a professor actually sees stays in Spanish: they are
-Colombian users of a Colombian classroom tool. The language of the code and
-the language of the product are two different decisions.
+1. Sessions never ended. The `active` and `ended_at` columns existed but
+   nothing ever set them. Since `registered_where` decides "aula" or "pre"
+   by asking whether any session is active, every registration after the
+   first class would have been labelled "aula" forever, including one done
+   from home on a Sunday. The adoption number would have been meaningless.
 
-Route changes (the old Spanish paths no longer exist):
-    /registro            -> /register
-    /registro/confirmar  -> /register/confirm
-    /qr-registro         -> /qr-register
-    /qr-registro-pagina  -> /qr-register-page
+   Starting a session now also closes any session left open, so a forgotten
+   click cannot corrupt later data.
+
+2. Past sessions could not be reached. The CSV link only worked for the
+   session held in that browser tab. Close the tab after class and the data
+   was unreachable, and on the free Render plan the database is wiped on
+   restart. One closed tab could have destroyed the experiment.
+
+   There is now a /sessions page listing every session with its download
+   link, and the teacher screen pushes the download in front of you the
+   moment a session ends.
 
 HOW TO RUN:
     source venv/bin/activate
@@ -175,6 +180,15 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def to_local(iso_text: str | None) -> str:
+    """UTC on disk, Bogota on screen. Storing UTC is correct; showing it is not."""
+    if not iso_text:
+        return ""
+    return (datetime.fromisoformat(iso_text)
+            .astimezone(LOCAL_TZ)
+            .strftime("%Y-%m-%d %H:%M"))
+
+
 # ---------------------------------------------------------------
 # TEACHER AUTHENTICATION
 #
@@ -206,6 +220,9 @@ def wrap(body: str) -> str:
   a.link-button {{ display: block; background: #1a7f37; color: white; padding: 16px;
                    text-decoration: none; border-radius: 8px; margin-top: 16px; font-size: 20px; }}
   form {{ max-width: 420px; margin: 0 auto; }}
+  table {{ margin: 0 auto; border-collapse: collapse; }}
+  th, td {{ padding: 10px 16px; border-bottom: 1px solid #ddd; text-align: left; }}
+  th {{ color: #555; font-weight: normal; }}
 </style>
 </head>
 <body>{body}</body>
@@ -272,11 +289,14 @@ TEACHER_PAGE = """
     body { font-family: -apple-system, sans-serif; text-align: center; padding: 30px; }
     #qr { width: 380px; height: 380px; }
     #count { font-size: 60px; font-weight: bold; margin: 12px; }
+    #finalCount { font-size: 60px; font-weight: bold; margin: 12px; }
     button { font-size: 22px; padding: 14px 28px; cursor: pointer; margin: 6px; }
+    button.end { background: #b91c1c; color: white; border: none; border-radius: 8px; }
     .row { display: flex; justify-content: center; gap: 40px; align-items: flex-start; }
     .panel { text-align: center; }
     h3 { color: #555; font-weight: normal; }
     .logout { position: absolute; top: 16px; right: 24px; font-size: 14px; color: #888; }
+    .warn { color: #b91c1c; max-width: 480px; margin: 16px auto; }
   </style>
 </head>
 <body>
@@ -286,6 +306,7 @@ TEACHER_PAGE = """
   <div id="before">
     <button onclick="startSession()">Iniciar asistencia</button>
     <p><a href="/qr-register-page">Mostrar QR de registro</a></p>
+    <p><a href="/sessions">Ver clases anteriores</a></p>
   </div>
 
   <div id="during" style="display:none">
@@ -303,12 +324,26 @@ TEACHER_PAGE = """
         <input id="manualCode" placeholder="Codigo de estudiante">
         <button onclick="addManual()">Agregar</button>
         <p id="manualMessage"></p>
+        <hr>
+        <button class="end" onclick="endSession()">Terminar asistencia</button>
       </div>
     </div>
   </div>
 
+  <div id="finished" style="display:none">
+    <h2>Asistencia terminada</h2>
+    <div id="finalCount"></div>
+    <p>estudiantes presentes</p>
+    <button onclick="downloadCsv()">Descargar CSV</button>
+    <p class="warn">Descarga el archivo ahora. En el plan gratuito de Render
+    los datos se pierden si el servicio se reinicia.</p>
+    <p><a href="/sessions">Ver clases anteriores</a> &middot; <a href="/">Volver al inicio</a></p>
+  </div>
+
 <script>
 let sessionId = null;
+let qrTimer = null;
+let countTimer = null;
 
 async function startSession() {
   const response = await fetch('/session/start', { method: 'POST' });
@@ -323,8 +358,24 @@ async function startSession() {
 
   // The ?t= forces the browser to fetch the image again instead of
   // reusing the cached one.
-  setInterval(refreshQR, SECONDS * 1000);
-  setInterval(refreshCount, 3000);
+  qrTimer = setInterval(refreshQR, SECONDS * 1000);
+  countTimer = setInterval(refreshCount, 3000);
+}
+
+async function endSession() {
+  if (!confirm('Terminar la asistencia de esta clase?')) return;
+
+  // Stop the timers first, so nothing keeps minting nonces for a
+  // session that is already closed.
+  clearInterval(qrTimer);
+  clearInterval(countTimer);
+
+  const response = await fetch('/session/' + sessionId + '/end', { method: 'POST' });
+  const data = await response.json();
+
+  document.getElementById('during').style.display = 'none';
+  document.getElementById('finished').style.display = 'block';
+  document.getElementById('finalCount').textContent = data.count + ' de ' + data.total;
 }
 
 function refreshQR() {
@@ -380,6 +431,47 @@ def registration_qr_page(request: Request):
     """)
 
 
+@app.get("/sessions", response_class=HTMLResponse)
+def sessions_page(request: Request):
+    """
+    Every session ever held, with its download link.
+
+    Without this page the attendance data only existed in the browser tab
+    that started the session. Closing the tab after class made it
+    unreachable, which on the day of a real experiment means losing it.
+    """
+    if not is_teacher(request):
+        return RedirectResponse("/login", status_code=303)
+
+    conn = connect()
+    rows = conn.execute("""
+        SELECT s.id, s.course_name, s.started_at, s.ended_at, s.active,
+               (SELECT COUNT(*) FROM attendance a WHERE a.session_id = s.id) AS present
+        FROM sessions s
+        ORDER BY s.id DESC
+    """).fetchall()
+    conn.close()
+
+    if not rows:
+        return wrap("<h2>Clases anteriores</h2><p>Todavia no hay ninguna.</p>"
+                    "<p><a href='/'>Volver</a></p>")
+
+    body = ["<h2>Clases anteriores</h2><table>",
+            "<tr><th>Clase</th><th>Inicio</th><th>Fin</th>"
+            "<th>Presentes</th><th></th></tr>"]
+    for r in rows:
+        state = "en curso" if r["active"] else to_local(r["ended_at"])
+        body.append(
+            f"<tr><td>{r['course_name']} #{r['id']}</td>"
+            f"<td>{to_local(r['started_at'])}</td>"
+            f"<td>{state}</td>"
+            f"<td>{r['present']}</td>"
+            f"<td><a href='/session/{r['id']}/csv'>Descargar CSV</a></td></tr>"
+        )
+    body.append("</table><p><a href='/'>Volver</a></p>")
+    return wrap("".join(body))
+
+
 # ---------------------------------------------------------------
 # SESSIONS  (teacher only)
 # ---------------------------------------------------------------
@@ -390,6 +482,14 @@ def start_session(request: Request, course_name: str = "Genetica"):
         return Response(status_code=401)
 
     conn = connect()
+
+    # Close anything left open. If a previous class was never ended, every
+    # later registration would be labelled as happening in the classroom.
+    conn.execute(
+        "UPDATE sessions SET active = 0, ended_at = ? WHERE active = 1",
+        (now(),),
+    )
+
     c = conn.cursor()
     c.execute(
         "INSERT INTO sessions (course_name, started_at, active) VALUES (?, ?, 1)",
@@ -399,6 +499,26 @@ def start_session(request: Request, course_name: str = "Genetica"):
     session_id = c.lastrowid
     conn.close()
     return {"session_id": session_id, "course_name": course_name}
+
+
+@app.post("/session/{session_id}/end")
+def end_session(session_id: int, request: Request):
+    if not is_teacher(request):
+        return Response(status_code=401)
+
+    conn = connect()
+    conn.execute(
+        "UPDATE sessions SET active = 0, ended_at = ? WHERE id = ? AND active = 1",
+        (now(), session_id),
+    )
+    conn.commit()
+
+    present = conn.execute(
+        "SELECT COUNT(*) AS n FROM attendance WHERE session_id = ?", (session_id,)
+    ).fetchone()["n"]
+    total = conn.execute("SELECT COUNT(*) AS n FROM students").fetchone()["n"]
+    conn.close()
+    return {"count": present, "total": total}
 
 
 @app.get("/session/{session_id}/count")
@@ -438,13 +558,8 @@ def export_csv(session_id: int, request: Request):
 
     lines = ["codigo,nombre,hora,metodo,donde_se_registro"]
     for r in rows:
-        # Stored in UTC, shown in Bogota time. Storing UTC is correct;
-        # displaying it is not.
-        local_time = (datetime.fromisoformat(r["timestamp"])
-                      .astimezone(LOCAL_TZ)
-                      .strftime("%Y-%m-%d %H:%M"))
         lines.append(
-            f"{r['student_code']},{r['name']},{local_time},"
+            f"{r['student_code']},{r['name']},{to_local(r['timestamp'])},"
             f"{r['method']},{r['registered_where'] or ''}"
         )
     text = "\n".join(lines)
@@ -630,6 +745,9 @@ def step2_confirm(request: Request, student_code: str = Form(...)):
     code = student_code.strip().upper()
 
     conn = connect()
+    # Now that sessions are actually closed, this answer is meaningful:
+    # it really does distinguish registering in class from registering
+    # beforehand.
     active = conn.execute(
         "SELECT id FROM sessions WHERE active = 1 ORDER BY id DESC LIMIT 1"
     ).fetchone()
@@ -702,6 +820,16 @@ def checkin(s: int, n: str, request: Request):
             <p style="margin-top:20px;color:#666">Necesitas el codigo que te
             entregaron. Despues de registrarte, vuelve a escanear el QR.</p>
         """)
+
+    # A closed session accepts nothing, even with a nonce that has not
+    # expired yet.
+    session_row = conn.execute(
+        "SELECT active FROM sessions WHERE id = ?", (s,)
+    ).fetchone()
+    if session_row is None or not session_row["active"]:
+        conn.close()
+        return wrap("<p class='error'>Esta clase ya termino</p>"
+                    "<p>Si crees que es un error, avisale a la profesora.</p>")
 
     valid, reason = check_nonce(conn, s, n)
     if not valid:

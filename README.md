@@ -27,6 +27,8 @@ The current prototype includes:
 - Manual attendance override for professors
 - Attendance export to CSV
 - Password authentication for the teacher interface and QR endpoint
+- Ending an attendance session
+- A page listing previous classes with their attendance downloads
 - Deployment on Render
 
 ## What is not built yet
