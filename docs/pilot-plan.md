@@ -48,7 +48,16 @@ código real de la lista. Regístrate, inicia sesión de asistencia, escanea.
 Si funciona con uno, funciona con veinte.
 
 **Definir la contraseña que va a usar tu mamá** y dársela. Que no sea la de
-Uninorte.
+Uninorte. 
+
+**Y a partir de ahí, congelar.** El plan gratuito de Render borra la base de
+datos en cada despliegue. Desde que subes la lista real hasta que descargas
+el CSV al salir del salón, no hagas `git push`, no cambies el Secret File,
+no toques nada en Render. Cualquiera de esas cosas dispara un despliegue y
+se pierden todos los registros y toda la asistencia.
+
+Si necesitas arreglar algo del código, hazlo antes de subir la lista, o
+después de descargar el CSV. Nunca en el medio.
 
 ---
 
