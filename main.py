@@ -1,30 +1,23 @@
 """
 UniPresence - Privacy-preserving physical presence verification for large classrooms
-MVP day 2c: teacher authentication
+MVP day 2d: code fully in English
 
-WHAT CHANGED FROM 2b:
+WHAT CHANGED FROM 2c:
+Only naming. No behaviour changed.
 
-Two endpoints were open to anyone on the internet:
+Python comments were already in English. This pass renames the JavaScript
+variables and functions, the HTML element ids, the CSS class names, the JSON
+keys and the URL paths, so the whole codebase reads in one language.
 
-  /                 the teacher screen. Anyone with the link could start a
-                    session, manually mark students present, and download the
-                    CSV with every student name. Found while writing the
-                    threat model.
+Everything a student or a professor actually sees stays in Spanish: they are
+Colombian users of a Colombian classroom tool. The language of the code and
+the language of the product are two different decisions.
 
-  /qr/{session_id}  the attendance QR image. This one is worse. It returns a
-                    freshly minted, currently valid nonce. A registered
-                    student could request it from home, read the nonce and
-                    check in without ever seeing the projector. Session ids
-                    are small integers, so they are trivial to guess.
-                    That breaks presence verification entirely.
-
-Both now require a teacher session. The QR exists only on the projector again.
-
-WHAT THIS DOES NOT SOLVE:
-A single shared password means everyone who knows it has full access and
-there is no record of who did what. The correct fix is institutional login
-(each professor already has a university account). That is out of scope for
-this prototype and is documented as an open risk.
+Route changes (the old Spanish paths no longer exist):
+    /registro            -> /register
+    /registro/confirmar  -> /register/confirm
+    /qr-registro         -> /qr-register
+    /qr-registro-pagina  -> /qr-register-page
 
 HOW TO RUN:
     source venv/bin/activate
@@ -43,6 +36,7 @@ import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+
 import qrcode
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
@@ -53,6 +47,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response, Streamin
 
 DB_PATH = "unipresence.db"
 ROSTER_PATH = "roster.csv"
+LOCAL_TZ = ZoneInfo("America/Bogota")
 
 # How long each attendance QR stays valid.
 # Design decision: shorter makes relaying over WhatsApp harder; longer is
@@ -139,6 +134,9 @@ def load_roster():
     """
     Read roster.csv and insert any students that are missing.
 
+    The CSV headers stay in Spanish because that file is maintained by the
+    professor, not by the developer.
+
     INSERT OR IGNORE means: if the code already exists, do nothing. The
     server can restart without wiping existing registrations, and new
     students can be appended to the file without breaking anything.
@@ -191,6 +189,7 @@ def is_teacher(request: Request) -> bool:
 
 
 def wrap(body: str) -> str:
+    """Wrap a fragment in the shared student-facing page shell."""
     return f"""
 <!DOCTYPE html>
 <html lang="es">
@@ -200,12 +199,12 @@ def wrap(body: str) -> str:
   body {{ font-family: -apple-system, sans-serif; padding: 40px 24px; text-align: center; }}
   .ok {{ color: #1a7f37; font-size: 28px; font-weight: bold; }}
   .error {{ color: #b91c1c; font-size: 24px; font-weight: bold; }}
-  .nombre {{ font-size: 30px; font-weight: bold; margin: 20px 0; }}
+  .name {{ font-size: 30px; font-weight: bold; margin: 20px 0; }}
   input, button {{ font-size: 20px; padding: 12px; width: 100%; box-sizing: border-box; margin: 8px 0; }}
   button {{ background: #1a7f37; color: white; border: none; border-radius: 8px; }}
-  button.gris {{ background: #666; }}
-  a.boton {{ display: block; background: #1a7f37; color: white; padding: 16px;
-             text-decoration: none; border-radius: 8px; margin-top: 16px; font-size: 20px; }}
+  button.grey {{ background: #666; }}
+  a.link-button {{ display: block; background: #1a7f37; color: white; padding: 16px;
+                   text-decoration: none; border-radius: 8px; margin-top: 16px; font-size: 20px; }}
   form {{ max-width: 420px; margin: 0 auto; }}
 </style>
 </head>
@@ -221,9 +220,9 @@ def login_page(error: str = ""):
             "<p class='error'>Configuracion incompleta</p>"
             "<p>El servidor no tiene contrasena configurada.</p>"
         )
-    aviso = "<p class='error'>Contrasena incorrecta</p>" if error else ""
+    warning = "<p class='error'>Contrasena incorrecta</p>" if error else ""
     return wrap(f"""
-        {aviso}
+        {warning}
         <h2>UniPresence</h2>
         <p>Pantalla del profesor</p>
         <form method="post" action="/login">
@@ -272,87 +271,87 @@ TEACHER_PAGE = """
   <style>
     body { font-family: -apple-system, sans-serif; text-align: center; padding: 30px; }
     #qr { width: 380px; height: 380px; }
-    #contador { font-size: 60px; font-weight: bold; margin: 12px; }
+    #count { font-size: 60px; font-weight: bold; margin: 12px; }
     button { font-size: 22px; padding: 14px 28px; cursor: pointer; margin: 6px; }
-    .fila { display: flex; justify-content: center; gap: 40px; align-items: flex-start; }
+    .row { display: flex; justify-content: center; gap: 40px; align-items: flex-start; }
     .panel { text-align: center; }
     h3 { color: #555; font-weight: normal; }
-    .salir { position: absolute; top: 16px; right: 24px; font-size: 14px; color: #888; }
+    .logout { position: absolute; top: 16px; right: 24px; font-size: 14px; color: #888; }
   </style>
 </head>
 <body>
-  <a class="salir" href="/logout">Salir</a>
+  <a class="logout" href="/logout">Salir</a>
   <h1>UniPresence</h1>
 
-  <div id="antes">
-    <button onclick="iniciar()">Iniciar asistencia</button>
-    <p><a href="/qr-registro-pagina">Mostrar QR de registro</a></p>
+  <div id="before">
+    <button onclick="startSession()">Iniciar asistencia</button>
+    <p><a href="/qr-register-page">Mostrar QR de registro</a></p>
   </div>
 
-  <div id="durante" style="display:none">
-    <div class="fila">
+  <div id="during" style="display:none">
+    <div class="row">
       <div class="panel">
         <h3>Escanea para marcar asistencia</h3>
         <img id="qr" src="">
       </div>
       <div class="panel">
         <h3>Presentes</h3>
-        <div id="contador">0</div>
-        <button onclick="exportar()">Descargar CSV</button>
+        <div id="count">0</div>
+        <button onclick="downloadCsv()">Descargar CSV</button>
         <hr>
         <h3>Agregar manualmente</h3>
-        <input id="codigoManual" placeholder="Codigo de estudiante">
-        <button onclick="manual()">Agregar</button>
-        <p id="msgManual"></p>
+        <input id="manualCode" placeholder="Codigo de estudiante">
+        <button onclick="addManual()">Agregar</button>
+        <p id="manualMessage"></p>
       </div>
     </div>
   </div>
 
 <script>
-let sesion = null;
+let sessionId = null;
 
-async function iniciar() {
-  const r = await fetch('/session/start', { method: 'POST' });
-  const datos = await r.json();
-  sesion = datos.session_id;
+async function startSession() {
+  const response = await fetch('/session/start', { method: 'POST' });
+  const data = await response.json();
+  sessionId = data.session_id;
 
-  document.getElementById('antes').style.display = 'none';
-  document.getElementById('durante').style.display = 'block';
+  document.getElementById('before').style.display = 'none';
+  document.getElementById('during').style.display = 'block';
 
-  refrescarQR();
-  refrescarContador();
+  refreshQR();
+  refreshCount();
 
   // The ?t= forces the browser to fetch the image again instead of
   // reusing the cached one.
-  setInterval(refrescarQR, SECONDS * 1000);
-  setInterval(refrescarContador, 3000);
+  setInterval(refreshQR, SECONDS * 1000);
+  setInterval(refreshCount, 3000);
 }
 
-function refrescarQR() {
-  document.getElementById('qr').src = '/qr/' + sesion + '?t=' + Date.now();
+function refreshQR() {
+  document.getElementById('qr').src = '/qr/' + sessionId + '?t=' + Date.now();
 }
 
-async function refrescarContador() {
-  const r = await fetch('/session/' + sesion + '/count');
-  const datos = await r.json();
-  document.getElementById('contador').textContent = datos.count + ' de ' + datos.total;
+async function refreshCount() {
+  const response = await fetch('/session/' + sessionId + '/count');
+  const data = await response.json();
+  document.getElementById('count').textContent = data.count + ' de ' + data.total;
 }
 
-async function manual() {
-  const codigo = document.getElementById('codigoManual').value.trim();
-  if (!codigo) return;
-  const cuerpo = new FormData();
-  cuerpo.append('student_code', codigo);
-  cuerpo.append('session_id', sesion);
-  const r = await fetch('/manual', { method: 'POST', body: cuerpo });
-  const datos = await r.json();
-  document.getElementById('msgManual').textContent = datos.mensaje;
-  document.getElementById('codigoManual').value = '';
-  refrescarContador();
+async function addManual() {
+  const code = document.getElementById('manualCode').value.trim();
+  if (!code) return;
+  const form = new FormData();
+  form.append('student_code', code);
+  form.append('session_id', sessionId);
+  const response = await fetch('/manual', { method: 'POST', body: form });
+  const data = await response.json();
+  document.getElementById('manualMessage').textContent = data.message;
+  document.getElementById('manualCode').value = '';
+  refreshCount();
 }
 
-function exportar() {
-  window.location = '/session/' + sesion + '/csv';
+function downloadCsv() {
+  window.location = '/session/' + sessionId + '/csv';
 }
 </script>
 </body>
@@ -367,7 +366,7 @@ def teacher_screen(request: Request):
     return HTMLResponse(TEACHER_PAGE.replace("SECONDS", str(NONCE_SECONDS)))
 
 
-@app.get("/qr-registro-pagina", response_class=HTMLResponse)
+@app.get("/qr-register-page", response_class=HTMLResponse)
 def registration_qr_page(request: Request):
     """Screen to project at the start of the first class."""
     if not is_teacher(request):
@@ -376,7 +375,7 @@ def registration_qr_page(request: Request):
         <h1>Registro UniPresence</h1>
         <p>Escanea una sola vez. Necesitas el codigo que te entregaron.</p>
         <p>Esto no marca asistencia.</p>
-        <img src="/qr-registro" style="width:380px">
+        <img src="/qr-register" style="width:380px">
         <p><a href="/">Volver</a></p>
     """)
 
@@ -418,7 +417,12 @@ def session_count(session_id: int, request: Request):
 
 @app.get("/session/{session_id}/csv")
 def export_csv(session_id: int, request: Request):
-    """Download the attendance list. The first thing a professor wants to see."""
+    """
+    Download the attendance list. The first thing a professor wants to see.
+
+    The column headers stay in Spanish: this file is opened by the professor,
+    not by a developer.
+    """
     if not is_teacher(request):
         return Response(status_code=401)
 
@@ -436,9 +440,12 @@ def export_csv(session_id: int, request: Request):
     for r in rows:
         # Stored in UTC, shown in Bogota time. Storing UTC is correct;
         # displaying it is not.
-        hora = datetime.fromisoformat(r["timestamp"]).astimezone(ZoneInfo("America/Bogota")).strftime("%Y-%m-%d %H:%M")
+        local_time = (datetime.fromisoformat(r["timestamp"])
+                      .astimezone(LOCAL_TZ)
+                      .strftime("%Y-%m-%d %H:%M"))
         lines.append(
-            f"{r['student_code']},{r['name']},{hora},{r['method']},{r['registered_where'] or ''}"
+            f"{r['student_code']},{r['name']},{local_time},"
+            f"{r['method']},{r['registered_where'] or ''}"
         )
     text = "\n".join(lines)
 
@@ -498,7 +505,7 @@ def attendance_qr(session_id: int, request: Request):
     return qr_png(f"{base}/checkin?s={session_id}&n={nonce}")
 
 
-@app.get("/qr-registro")
+@app.get("/qr-register")
 def registration_qr(request: Request):
     """
     Fixed registration QR. It does not rotate, expire or carry a nonce.
@@ -508,7 +515,7 @@ def registration_qr(request: Request):
     nothing.
     """
     base = str(request.base_url).rstrip("/")
-    return qr_png(f"{base}/registro")
+    return qr_png(f"{base}/register")
 
 
 # ---------------------------------------------------------------
@@ -524,14 +531,14 @@ CODE_FORM = """
     <h2>Registro</h2>
     <p>Escribe el codigo que te entregaron. Se hace una sola vez
     y no marca asistencia.</p>
-    <form method="post" action="/registro">
+    <form method="post" action="/register">
       <input name="student_code" placeholder="Codigo" required autofocus autocapitalize="characters">
       <button type="submit">Continuar</button>
     </form>
 """
 
 
-@app.get("/registro", response_class=HTMLResponse)
+@app.get("/register", response_class=HTMLResponse)
 def registration_page(request: Request):
     device_id = request.cookies.get("device_id")
 
@@ -544,7 +551,7 @@ def registration_page(request: Request):
         if student:
             return wrap(
                 f"<p class='ok'>Ya estas registrado</p>"
-                f"<div class='nombre'>{student['name']}</div>"
+                f"<div class='name'>{student['name']}</div>"
                 f"<p>En clase solo escanea el QR de asistencia.</p>"
             )
 
@@ -556,7 +563,7 @@ def registration_page(request: Request):
     return response
 
 
-@app.post("/registro", response_class=HTMLResponse)
+@app.post("/register", response_class=HTMLResponse)
 def step1_check_code(request: Request, student_code: str = Form(...)):
     """Step 1: does the code exist and is it unclaimed? If so, show the name."""
     device_id = request.cookies.get("device_id")
@@ -580,7 +587,7 @@ def step1_check_code(request: Request, student_code: str = Form(...)):
     if already:
         return wrap(
             f"<p class='error'>Este telefono ya esta registrado</p>"
-            f"<div class='nombre'>{already['name']}</div>"
+            f"<div class='name'>{already['name']}</div>"
             f"<p>Un telefono solo puede pertenecer a un estudiante.</p>"
         )
 
@@ -602,18 +609,18 @@ def step1_check_code(request: Request, student_code: str = Form(...)):
 
     return wrap(f"""
         <h2>Confirma</h2>
-        <div class="nombre">{student['name']}</div>
-        <form method="post" action="/registro/confirmar">
+        <div class="name">{student['name']}</div>
+        <form method="post" action="/register/confirm">
           <input type="hidden" name="student_code" value="{student['student_code']}">
           <button type="submit">Si, soy yo</button>
         </form>
-        <form method="get" action="/registro">
-          <button type="submit" class="gris">No, volver</button>
+        <form method="get" action="/register">
+          <button type="submit" class="grey">No, volver</button>
         </form>
     """)
 
 
-@app.post("/registro/confirmar", response_class=HTMLResponse)
+@app.post("/register/confirm", response_class=HTMLResponse)
 def step2_confirm(request: Request, student_code: str = Form(...)):
     """Step 2: bind this phone to that student."""
     device_id = request.cookies.get("device_id")
@@ -649,7 +656,7 @@ def step2_confirm(request: Request, student_code: str = Form(...)):
 
     return wrap(
         f"<p class='ok'>Telefono registrado</p>"
-        f"<div class='nombre'>{student['name']}</div>"
+        f"<div class='name'>{student['name']}</div>"
         f"<p>En clase, apunta la camara al QR de la pantalla. "
         f"No vas a tener que escribir nada.</p>"
     )
@@ -691,7 +698,7 @@ def checkin(s: int, n: str, request: Request):
         return wrap("""
             <h2>Primero registrate</h2>
             <p>Este telefono todavia no esta asociado a ningun estudiante.</p>
-            <a class="boton" href="/registro">Registrarme ahora</a>
+            <a class="link-button" href="/register">Registrarme ahora</a>
             <p style="margin-top:20px;color:#666">Necesitas el codigo que te
             entregaron. Despues de registrarte, vuelve a escanear el QR.</p>
         """)
@@ -703,7 +710,7 @@ def checkin(s: int, n: str, request: Request):
 
     message = record_attendance(conn, s, student["id"], n, "qr")
     conn.close()
-    return wrap(f"{message}<div class='nombre'>{student['name']}</div>")
+    return wrap(f"{message}<div class='name'>{student['name']}</div>")
 
 
 @app.post("/manual")
@@ -728,12 +735,12 @@ def manual_override(request: Request,
 
     if student is None:
         conn.close()
-        return {"mensaje": "Ese codigo no esta en la lista del curso."}
+        return {"message": "Ese codigo no esta en la lista del curso."}
 
-    message = record_attendance(conn, session_id, student["id"], None, "manual")
+    result = record_attendance(conn, session_id, student["id"], None, "manual")
     conn.close()
     name = student["name"]
-    return {"mensaje": f"{name}: agregado." if "registrada" in message
+    return {"message": f"{name}: agregado." if "registrada" in result
             else f"{name}: ya estaba."}
 
 
