@@ -68,6 +68,11 @@ Install the dependencies:
 ```bash
 pip install -r requirements.txt
 ```
+Copy the example roster:
+
+​```bash
+cp roster.example.csv roster.csv
+​```
 
 Set the teacher password and start the server:
 

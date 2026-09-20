@@ -2,3 +2,6 @@ venv/
 __pycache__/
 *.db
 .DS_Store
+roster.csv
+codes_to_print.html
+prueba.csv
