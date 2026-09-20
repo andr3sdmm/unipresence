@@ -11,7 +11,9 @@ UniPresence currently stores only the information needed to register students an
 - **Attendance method:** records whether attendance was registered through the QR flow or manually by the professor.
 - **Registration context:** records whether the action occurred during pre-class registration or classroom attendance.
 
-The `roster.csv` file included in this repository contains fictional names created only for testing. It does not contain real Universidad del Norte student records.
+The roster is handled in two parts. `roster.example.csv` is committed to this repository and contains fictional names created only for testing. The real course roster lives in `roster.csv`, which is listed in `.gitignore` and is never committed.
+
+In production the real roster is uploaded to Render as a secret file. Render places it next to the application when the service deploys, so it never passes through the public repository.
 
 
 ## What is stored on the student's device
@@ -52,7 +54,7 @@ The current shared-password approach limits access, but it does not identify whi
 
 The prototype currently has no automatic data-deletion or retention policy.
 
-At the same time, the current free Render deployment does not provide reliable persistent storage for this data. Stored information may therefore be lost when the service restarts.
+At the same time, the current free Render deployment does not provide reliable persistent storage for this data. Stored information is lost whenever the service restarts or redeploys, and a redeploy is triggered by any change to the code or the configuration. In practice this means attendance records have to be exported immediately after each class.
 
 These are separate limitations: the application does not intentionally delete records after a defined period, but the current hosting environment also does not guarantee that they will remain stored.
 

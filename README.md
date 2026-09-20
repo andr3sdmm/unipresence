@@ -26,6 +26,7 @@ The current prototype includes:
 - Phone-to-student binding
 - Manual attendance override for professors
 - Attendance export to CSV
+- A script that generates one private code per student and a printable sheet of slips
 - Password authentication for the teacher interface and QR endpoint
 - Ending an attendance session
 - A page listing previous classes with their attendance downloads
@@ -79,6 +80,20 @@ Set the teacher password and start the server:
 ```bash
 TEACHER_PASSWORD="your-password" uvicorn main:app --reload
 ```
+
+## Preparing a course roster
+
+`generate_codes.py` turns a list of student names into two files: the roster the application reads, and a page of slips to print, cut and hand out.
+
+```bash
+python3 generate_codes.py students.csv "Course name"
+```
+
+The input can be a CSV exported from any system, or a plain text file with one name per line. It writes `roster.csv` and `codes_to_print.html`.
+
+Each slip carries one student's name and their own code. Codes avoid characters that are easy to confuse on paper: no 0 or O, no 1 or I.
+
+The security of the system depends on each student receiving a code nobody else knows, so the slips are meant to be handed out individually rather than read aloud or posted to a group chat.
 
 ## Project log
 
