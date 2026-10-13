@@ -1,28 +1,47 @@
 """
 UniPresence - Privacy-preserving physical presence verification for large classrooms
-MVP day 2e: ending a session, and getting the data back
+Day 4: fixing what the real classroom pilot broke
 
-WHAT CHANGED FROM 2d:
+WHAT CHANGED, AND WHY
 
-Two gaps that would only have shown up on the day of the real classroom test.
+On 22 September 2026 this ran in a real genetics lab: 22 students, the
+professor operating it alone. 15 checked in. 7 could not.
 
-1. Sessions never ended. The `active` and `ended_at` columns existed but
-   nothing ever set them. Since `registered_where` decides "aula" or "pre"
-   by asking whether any session is active, every registration after the
-   first class would have been labelled "aula" forever, including one done
-   from home on a Sunday. The adoption number would have been meaningless.
+The video the professor recorded shows what happened to them. A student
+scans the attendance QR, is told "Primero registrate", types the code he
+was given, and is told "Ese codigo ya fue usado". Both screens are the
+system working exactly as written, and both are wrong about him. He HAD
+registered, minutes earlier. The binding between a student and a phone
+lives in a cookie, and a cookie lives inside one browser. He opened the
+registration link inside WhatsApp, then scanned the QR with the camera,
+which opens Safari. Two browsers, two cookie jars, one student the system
+could no longer recognise.
 
-   Starting a session now also closes any session left open, so a forgotten
-   click cannot corrupt later data.
+So the diagnosis is not that students cheated or that the network failed.
+It is that I built device binding on something narrower than a device.
 
-2. Past sessions could not be reached. The CSV link only worked for the
-   session held in that browser tab. Close the tab after class and the data
-   was unreachable, and on the free Render plan the database is wiped on
-   restart. One closed tab could have destroyed the experiment.
+Three changes follow from that:
 
-   There is now a /sessions page listing every session with its download
-   link, and the teacher screen pushes the download in front of you the
-   moment a session ends.
+1. A student who is not recognised at check-in can type their code right
+   there and bind this browser, instead of being sent away. Re-binding is
+   allowed on purpose: the alternative, which is what the pilot did, is to
+   lock a present student out of their own attendance.
+
+2. Re-binding is never silent. Every change is written to a device_changes
+   table, counted on the teacher's screen while class runs, and marked in
+   the CSV. The one-phone-one-student rule is now enforced by visibility
+   rather than by refusal, which is the honest trade: a stolen code can
+   move a registration, and the teacher sees that it moved.
+
+3. The message that accused a student of theft is gone. It now offers the
+   explanation that was true for all 7 of them, and keeps the warning for
+   the case where it was not.
+
+WHAT THIS DOES NOT FIX
+
+The pilot also lost its stored data when Render's free instance went to
+sleep. That needs a database that outlives the process, and it is the next
+change, not this one.
 
 HOW TO RUN:
     source venv/bin/activate
@@ -119,6 +138,23 @@ def init_db():
         )
     """)
 
+    # Every time a roster code moves to a different browser or phone.
+    #
+    # This table is the price of letting students re-bind. Re-binding keeps
+    # present students from being locked out, but it also means a leaked code
+    # can be moved by whoever holds it. Writing every move down is what keeps
+    # that visible instead of invisible.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS device_changes (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER NOT NULL,
+            old_device TEXT,
+            new_device TEXT NOT NULL,
+            changed_at TEXT NOT NULL,
+            session_id INTEGER
+        )
+    """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS attendance (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -187,6 +223,69 @@ def to_local(iso_text: str | None) -> str:
     return (datetime.fromisoformat(iso_text)
             .astimezone(LOCAL_TZ)
             .strftime("%Y-%m-%d %H:%M"))
+
+
+# ---------------------------------------------------------------
+# BINDING A CODE TO A BROWSER
+#
+# One function for all three paths that need it: registering for the first
+# time, re-binding from the registration page, and re-binding in the middle
+# of a check-in. They used to be three different pieces of logic, which is
+# how the pilot ended up with two screens that contradicted each other.
+# ---------------------------------------------------------------
+
+def bind_device(conn, student, device_id: str, session_id: int | None):
+    """
+    Point a roster code at this browser.
+
+    Returns (status, extra):
+        "ok"      first binding
+        "moved"   taken from another browser, logged in device_changes
+        "same"    already this browser, nothing to do
+        "taken"   this browser already belongs to another student (extra=row)
+        "retry"   someone else changed it while we were working
+    """
+    owner = conn.execute(
+        "SELECT * FROM students WHERE device_id = ?", (device_id,)
+    ).fetchone()
+    if owner and owner["id"] != student["id"]:
+        # The one rule that does not bend: a phone is one student's phone.
+        # Without this, two people share a handset and both get marked.
+        return "taken", owner
+
+    previous = student["device_id"]
+    if previous == device_id:
+        return "same", None
+
+    active = conn.execute(
+        "SELECT id FROM sessions WHERE active = 1 ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    where = "aula" if active else "pre"
+
+    # `device_id IS ?` holds the old value, NULL included, so the write only
+    # lands if nothing changed since we read the row. Two people confirming
+    # the same code at the same instant still produces exactly one winner.
+    cur = conn.execute(
+        "UPDATE students SET device_id = ?, "
+        "registered_at = COALESCE(registered_at, ?), "
+        "registered_where = COALESCE(registered_where, ?) "
+        "WHERE id = ? AND device_id IS ?",
+        (device_id, now(), where, student["id"], previous),
+    )
+    if cur.rowcount == 0:
+        conn.rollback()
+        return "retry", None
+
+    if previous:
+        conn.execute(
+            "INSERT INTO device_changes "
+            "(student_id, old_device, new_device, changed_at, session_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (student["id"], previous, device_id, now(), session_id),
+        )
+
+    conn.commit()
+    return ("moved" if previous else "ok"), None
 
 
 # ---------------------------------------------------------------
@@ -318,6 +417,7 @@ TEACHER_PAGE = """
       <div class="panel">
         <h3>Presentes</h3>
         <div id="count">0</div>
+        <p id="changes"></p>
         <button onclick="downloadCsv()">Descargar CSV</button>
         <hr>
         <h3>Agregar manualmente</h3>
@@ -334,6 +434,7 @@ TEACHER_PAGE = """
     <h2>Asistencia terminada</h2>
     <div id="finalCount"></div>
     <p>estudiantes presentes</p>
+    <p id="finalChanges" style="color:#b45309"></p>
     <button onclick="downloadCsv()">Descargar CSV</button>
     <p class="warn">Descarga el archivo ahora. En el plan gratuito de Render
     los datos se pierden si el servicio se reinicia.</p>
@@ -346,7 +447,11 @@ let qrTimer = null;
 let countTimer = null;
 
 async function startSession() {
-  const response = await fetch('/session/start', { method: 'POST' });
+  const name = prompt('Nombre de la clase', 'Genetica');
+  if (name === null) return;
+  const response = await fetch('/session/start?course_name=' +
+                               encodeURIComponent(name || 'Clase'),
+                               { method: 'POST' });
   const data = await response.json();
   sessionId = data.session_id;
 
@@ -376,6 +481,10 @@ async function endSession() {
   document.getElementById('during').style.display = 'none';
   document.getElementById('finished').style.display = 'block';
   document.getElementById('finalCount').textContent = data.count + ' de ' + data.total;
+  if (data.changes) {
+    document.getElementById('finalChanges').textContent =
+      data.changes + ' estudiante(s) cambiaron de dispositivo en esta clase';
+  }
 }
 
 function refreshQR() {
@@ -386,6 +495,10 @@ async function refreshCount() {
   const response = await fetch('/session/' + sessionId + '/count');
   const data = await response.json();
   document.getElementById('count').textContent = data.count + ' de ' + data.total;
+  // Only shown when it happens. A zero on screen every class teaches the
+  // teacher to ignore the line.
+  document.getElementById('changes').textContent =
+    data.changes ? 'Cambios de dispositivo: ' + data.changes : '';
 }
 
 async function addManual() {
@@ -517,8 +630,11 @@ def end_session(session_id: int, request: Request):
         "SELECT COUNT(*) AS n FROM attendance WHERE session_id = ?", (session_id,)
     ).fetchone()["n"]
     total = conn.execute("SELECT COUNT(*) AS n FROM students").fetchone()["n"]
+    changes = conn.execute(
+        "SELECT COUNT(*) AS n FROM device_changes WHERE session_id = ?", (session_id,)
+    ).fetchone()["n"]
     conn.close()
-    return {"count": present, "total": total}
+    return {"count": present, "total": total, "changes": changes}
 
 
 @app.get("/session/{session_id}/count")
@@ -531,8 +647,13 @@ def session_count(session_id: int, request: Request):
         "SELECT COUNT(*) AS n FROM attendance WHERE session_id = ?", (session_id,)
     ).fetchone()["n"]
     total = conn.execute("SELECT COUNT(*) AS n FROM students").fetchone()["n"]
+    # Device changes during THIS class. A couple are normal, a student who
+    # changed phones. A sudden run of them during an exam is worth a look.
+    changes = conn.execute(
+        "SELECT COUNT(*) AS n FROM device_changes WHERE session_id = ?", (session_id,)
+    ).fetchone()["n"]
     conn.close()
-    return {"count": present, "total": total}
+    return {"count": present, "total": total, "changes": changes}
 
 
 @app.get("/session/{session_id}/csv")
@@ -548,7 +669,9 @@ def export_csv(session_id: int, request: Request):
 
     conn = connect()
     rows = conn.execute("""
-        SELECT s.student_code, s.name, a.timestamp, a.method, s.registered_where
+        SELECT s.student_code, s.name, a.timestamp, a.method, s.registered_where,
+               (SELECT COUNT(*) FROM device_changes d
+                 WHERE d.student_id = s.id AND d.session_id = a.session_id) AS moved
         FROM attendance a
         JOIN students s ON s.id = a.student_id
         WHERE a.session_id = ?
@@ -556,11 +679,12 @@ def export_csv(session_id: int, request: Request):
     """, (session_id,)).fetchall()
     conn.close()
 
-    lines = ["codigo,nombre,hora,metodo,donde_se_registro"]
+    lines = ["codigo,nombre,hora,metodo,donde_se_registro,cambio_de_dispositivo"]
     for r in rows:
         lines.append(
             f"{r['student_code']},{r['name']},{to_local(r['timestamp'])},"
-            f"{r['method']},{r['registered_where'] or ''}"
+            f"{r['method']},{r['registered_where'] or ''},"
+            f"{'si' if r['moved'] else 'no'}"
         )
     text = "\n".join(lines)
 
@@ -646,6 +770,9 @@ CODE_FORM = """
     <h2>Registro</h2>
     <p>Escribe el codigo que te entregaron. Se hace una sola vez
     y no marca asistencia.</p>
+    <p style="color:#666;font-size:15px">Hazlo en el mismo navegador con el
+    que vas a escanear el QR en clase. Si abriste este enlace dentro de
+    WhatsApp o Instagram, mejor cierra y escanea el QR con la camara.</p>
     <form method="post" action="/register">
       <input name="student_code" placeholder="Codigo" required autofocus autocapitalize="characters">
       <button type="submit">Continuar</button>
@@ -715,12 +842,25 @@ def step1_check_code(request: Request, student_code: str = Form(...)):
         )
 
     if student["device_id"]:
-        # Someone already used that code. If it was not you, the code leaked
-        # and that needs reporting. This is what makes the attack visible.
-        return wrap(
-            "<p class='error'>Ese codigo ya fue usado</p>"
-            "<p>Si tu no lo registraste, avisale a la profesora de inmediato.</p>"
-        )
+        # The pilot answered this case with "Ese codigo ya fue usado. Si tu
+        # no lo registraste, avisale a la profesora de inmediato", which told
+        # 7 students they were thieves of their own code. The common cause is
+        # far more boring: they registered in another browser.
+        #
+        # So: offer the move, and keep the warning for the case where the
+        # student really did not do it.
+        return wrap(f"""
+            <h2>Ese codigo ya esta vinculado</h2>
+            <div class="name">{student['name']}</div>
+            <p>Esta asociado a otro navegador o a otro telefono. Si fuiste tu,
+            puedes pasarlo a este.</p>
+            <form method="post" action="/register/relink">
+              <input type="hidden" name="student_code" value="{student['student_code']}">
+              <button type="submit">Si, soy yo, vincular aqui</button>
+            </form>
+            <p style="margin-top:20px;color:#666">El cambio le aparece a tu
+            profesora. Si no eres tu, no sigas: avisale de inmediato.</p>
+        """)
 
     return wrap(f"""
         <h2>Confirma</h2>
@@ -737,46 +877,57 @@ def step1_check_code(request: Request, student_code: str = Form(...)):
 
 @app.post("/register/confirm", response_class=HTMLResponse)
 def step2_confirm(request: Request, student_code: str = Form(...)):
-    """Step 2: bind this phone to that student."""
+    """Step 2: bind this browser to that student."""
+    return _finish_binding(request, student_code, moving=False)
+
+
+@app.post("/register/relink", response_class=HTMLResponse)
+def relink(request: Request, student_code: str = Form(...)):
+    """Move a code that is already bound somewhere else to this browser."""
+    return _finish_binding(request, student_code, moving=True)
+
+
+def _finish_binding(request: Request, student_code: str, moving: bool):
     device_id = request.cookies.get("device_id")
     if not device_id:
-        return wrap("<p class='error'>No se pudo identificar el dispositivo.</p>")
+        return wrap("<p class='error'>No se pudo identificar este navegador</p>"
+                    "<p>Recarga la pagina e intenta de nuevo.</p>")
 
     code = student_code.strip().upper()
-
     conn = connect()
-    # Now that sessions are actually closed, this answer is meaningful:
-    # it really does distinguish registering in class from registering
-    # beforehand.
+    student = conn.execute(
+        "SELECT * FROM students WHERE UPPER(student_code) = ?", (code,)
+    ).fetchone()
+
+    if student is None:
+        conn.close()
+        return wrap("<p class='error'>Ese codigo no existe</p>" + CODE_FORM)
+
     active = conn.execute(
         "SELECT id FROM sessions WHERE active = 1 ORDER BY id DESC LIMIT 1"
     ).fetchone()
-    where = "aula" if active else "pre"
-
-    # WHERE device_id IS NULL is what protects against two people confirming
-    # the same code at the same moment: only the first write succeeds.
-    cur = conn.execute(
-        "UPDATE students SET device_id = ?, registered_at = ?, registered_where = ? "
-        "WHERE UPPER(student_code) = ? AND device_id IS NULL",
-        (device_id, now(), where, code),
-    )
-    conn.commit()
-
-    if cur.rowcount == 0:
-        conn.close()
-        return wrap("<p class='error'>Ese codigo ya fue usado</p>"
-                    "<p>Avisale a la profesora.</p>")
-
-    student = conn.execute(
-        "SELECT * FROM students WHERE device_id = ?", (device_id,)
-    ).fetchone()
+    status, other = bind_device(conn, student, device_id,
+                               active["id"] if active else None)
     conn.close()
 
+    if status == "taken":
+        return wrap(f"<p class='error'>Este telefono ya esta registrado</p>"
+                    f"<div class='name'>{other['name']}</div>"
+                    f"<p>Un telefono solo puede pertenecer a un estudiante.</p>")
+
+    if status == "retry":
+        return wrap("<p class='error'>Intentalo otra vez</p>"
+                    "<p>Alguien uso ese codigo en el mismo instante.</p>")
+
+    headline = "Telefono vinculado de nuevo" if status == "moved" else "Telefono registrado"
+    note = ("<p style='color:#666'>Tu profesora vera que lo cambiaste de "
+            "navegador.</p>" if status == "moved" else "")
+
     return wrap(
-        f"<p class='ok'>Telefono registrado</p>"
+        f"<p class='ok'>{headline}</p>"
         f"<div class='name'>{student['name']}</div>"
         f"<p>En clase, apunta la camara al QR de la pantalla. "
-        f"No vas a tener que escribir nada.</p>"
+        f"No vas a tener que escribir nada.</p>" + note
     )
 
 
@@ -809,17 +960,34 @@ def checkin(s: int, n: str, request: Request):
             "SELECT * FROM students WHERE device_id = ?", (device_id,)
         ).fetchone()
 
-    # Unregistered phone: we do not ask for the code here, because typing it
-    # takes longer than the 10 seconds the nonce lasts. Send them to register.
+    # Not recognised. In the pilot this screen sent the student away to
+    # register, and for 7 of them that was a dead end: they were already
+    # registered, in another browser, so registering again told them their
+    # own code was taken.
+    #
+    # Now the code box is right here. The nonce will usually expire while
+    # they type, and that is fine: binding is the slow part and happens
+    # once. The next scan is instant.
     if student is None:
         conn.close()
-        return wrap("""
-            <h2>Primero registrate</h2>
-            <p>Este telefono todavia no esta asociado a ningun estudiante.</p>
-            <a class="link-button" href="/register">Registrarme ahora</a>
-            <p style="margin-top:20px;color:#666">Necesitas el codigo que te
-            entregaron. Despues de registrarte, vuelve a escanear el QR.</p>
-        """)
+        response = HTMLResponse(wrap(f"""
+            <h2>Vincula este telefono</h2>
+            <p>Este navegador todavia no esta asociado a ningun estudiante.
+            Puede que te hayas registrado desde otra app.</p>
+            <form method="post" action="/checkin/link">
+              <input type="hidden" name="s" value="{s}">
+              <input type="hidden" name="n" value="{n}">
+              <input name="student_code" placeholder="Tu codigo" required autofocus
+                     autocapitalize="characters">
+              <button type="submit">Vincular</button>
+            </form>
+            <p style="margin-top:20px;color:#666">Se hace una sola vez desde
+            este navegador.</p>
+        """))
+        if not device_id:
+            response.set_cookie("device_id", secrets.token_hex(16),
+                                max_age=31536000, httponly=True, samesite="lax")
+        return response
 
     # A closed session accepts nothing, even with a nonce that has not
     # expired yet.
@@ -835,6 +1003,71 @@ def checkin(s: int, n: str, request: Request):
     if not valid:
         conn.close()
         return wrap(f"<p class='error'>{reason}</p>")
+
+    message = record_attendance(conn, s, student["id"], n, "qr")
+    conn.close()
+    return wrap(f"{message}<div class='name'>{student['name']}</div>")
+
+
+@app.post("/checkin/link", response_class=HTMLResponse)
+def checkin_link(request: Request,
+                 s: int = Form(...),
+                 n: str = Form(...),
+                 student_code: str = Form(...)):
+    """
+    Bind this browser from inside a check-in, then try to mark attendance.
+
+    This is the path the 7 students of the pilot needed and did not have.
+    """
+    device_id = request.cookies.get("device_id")
+    if not device_id:
+        return wrap("<p class='error'>No se pudo identificar este navegador</p>"
+                    "<p>Recarga la pagina e intenta de nuevo.</p>")
+
+    code = student_code.strip().upper()
+    conn = connect()
+    student = conn.execute(
+        "SELECT * FROM students WHERE UPPER(student_code) = ?", (code,)
+    ).fetchone()
+
+    if student is None:
+        conn.close()
+        return wrap("<p class='error'>Ese codigo no existe</p>"
+                    "<p>Revisa como esta escrito. Si sigue sin funcionar, "
+                    "avisale a la profesora y te agrega a mano.</p>")
+
+    status, other = bind_device(conn, student, device_id, s)
+
+    if status == "taken":
+        conn.close()
+        return wrap(f"<p class='error'>Este telefono ya es de otro estudiante</p>"
+                    f"<div class='name'>{other['name']}</div>"
+                    f"<p>Un telefono solo puede marcar por una persona.</p>")
+
+    if status == "retry":
+        conn.close()
+        return wrap("<p class='error'>Intentalo otra vez</p>"
+                    "<p>Alguien uso ese codigo en el mismo instante.</p>")
+
+    # The session may have closed, or the nonce expired while they typed.
+    # Either way the binding above is already saved, so the next scan works.
+    session_row = conn.execute(
+        "SELECT active FROM sessions WHERE id = ?", (s,)
+    ).fetchone()
+    if session_row is None or not session_row["active"]:
+        conn.close()
+        return wrap(f"<p class='ok'>Telefono vinculado</p>"
+                    f"<div class='name'>{student['name']}</div>"
+                    f"<p>Esta clase ya termino. Avisale a la profesora para "
+                    f"que te marque a mano.</p>")
+
+    valid, _ = check_nonce(conn, s, n)
+    if not valid:
+        conn.close()
+        return wrap(f"<p class='ok'>Telefono vinculado</p>"
+                    f"<div class='name'>{student['name']}</div>"
+                    f"<p>Ahora escanea otra vez el QR de la pantalla. "
+                    f"Esta vez no tienes que escribir nada.</p>")
 
     message = record_attendance(conn, s, student["id"], n, "qr")
     conn.close()
