@@ -69,16 +69,24 @@ Install the dependencies:
 ```bash
 pip install -r requirements.txt
 ```
-Copy the example roster:
-
-​```bash
-cp roster.example.csv roster.csv
-​```
-
-Set the teacher password and start the server:
+Version 2 stores everything in Postgres. Create a free database (for example
+on Neon), copy its connection string, and start the server with it:
 
 ```bash
-TEACHER_PASSWORD="your-password" uvicorn main:app --reload
+DATABASE_URL="postgresql://..." uvicorn main:app --reload
+```
+
+Open the site, create a teacher account, create a class (with or without a
+list; `roster.example.csv` is a sample list), and press "Tomar asistencia".
+
+Optional: `TEACHER_SIGNUP_CODE="..."` makes new teacher accounts require that code.
+
+To run the tests, point them at an empty database they are allowed to wipe
+(never the production one):
+
+```bash
+pip install -r requirements-dev.txt
+TEST_DATABASE_URL="postgresql://..." pytest -q
 ```
 
 ## Preparing a course roster

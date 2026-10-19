@@ -1,91 +1,117 @@
 """
 UniPresence - Privacy-preserving physical presence verification for large classrooms
-Day 4: fixing what the real classroom pilot broke
+Version 2: rebuilt from what the pilot of 22 September 2026 showed
 
 WHAT CHANGED, AND WHY
 
-On 22 September 2026 this ran in a real genetics lab: 22 students, the
-professor operating it alone. 15 checked in. 7 could not.
+Version 1 ran in a real genetics lab: 22 students, the professor operating it
+alone. 15 checked in, 7 could not, and the stored data was lost when Render's
+free instance went to sleep. Every change below answers one of those facts, or
+one thing the professor had to do by hand.
 
-The video the professor recorded shows what happened to them. A student
-scans the attendance QR, is told "Primero registrate", types the code he
-was given, and is told "Ese codigo ya fue usado". Both screens are the
-system working exactly as written, and both are wrong about him. He HAD
-registered, minutes earlier. The binding between a student and a phone
-lives in a cookie, and a cookie lives inside one browser. He opened the
-registration link inside WhatsApp, then scanned the QR with the camera,
-which opens Safari. Two browsers, two cookie jars, one student the system
-could no longer recognise.
+1. Data lives in Postgres (Neon), not in a SQLite file inside the server.
+   A restart, a redeploy or a sleeping instance no longer erases attendance.
 
-So the diagnosis is not that students cheated or that the network failed.
-It is that I built device binding on something narrower than a device.
+2. One QR does everything. Version 1 had a registration QR and an attendance
+   QR. The 7 failures came from that split: students registered inside
+   WhatsApp, then scanned with the camera, which opens Safari, and the system
+   no longer recognised them. Now the attendance QR is the only door. A phone
+   the system knows sees its class and taps Aceptar. A phone it does not know
+   types the carne once, right there, and is marked in the same step.
 
-Three changes follow from that:
+3. The professor prepares nothing. Each professor has an account and their
+   own classes. A class list can be uploaded or pasted once and is kept; a
+   class can also start with no list at all, and the list builds itself from
+   the students who check in (they wait as "pendiente" until approved).
+   The printed slips, the Python script and the secret file on Render are gone.
 
-1. A student who is not recognised at check-in can type their code right
-   there and bind this browser, instead of being sent away. Re-binding is
-   allowed on purpose: the alternative, which is what the pilot did, is to
-   lock a present student out of their own attendance.
+4. Fraud is made visible instead of forbidden with secrets. Without private
+   codes, a classmate can type someone else's carne. The system cannot stop
+   that without collecting data that identifies the phone, so it records what
+   is unusual and shows it to the professor under "Por revisar": a carne that
+   moves to another browser during class, several new phones linked in a few
+   seconds from the same browser and system, a link opened inside WhatsApp or
+   Instagram. These are leads, not proof. The professor decides.
 
-2. Re-binding is never silent. Every change is written to a device_changes
-   table, counted on the teacher's screen while class runs, and marked in
-   the CSV. The one-phone-one-student rule is now enforced by visibility
-   rather than by refusal, which is the honest trade: a stolen code can
-   move a registration, and the teacher sees that it moved.
+5. Every check-in records the browser, the operating system and whether the
+   page was opened inside an app. Only those three words are kept, never the
+   full User-Agent string, which is detailed enough to help identify a phone.
 
-3. The message that accused a student of theft is gone. It now offers the
-   explanation that was true for all 7 of them, and keeps the warning for
-   the case where it was not.
+6. The student gets a receipt: a full-screen green confirmation with a live
+   clock and a short receipt code. A screenshot of an old confirmation does
+   not show a running clock, and the code can be looked up in the report.
 
-WHAT THIS DOES NOT FIX
-
-The pilot also lost its stored data when Render's free instance went to
-sleep. That needs a database that outlives the process, and it is the next
-change, not this one.
+7. Reports: a printable page (saved as PDF from the browser), Excel and CSV.
+   The CSV of version 1 was built by joining text with commas, which broke on
+   any name that contained one. The reports show "Celular #1", never the real
+   device identifier: that value is the student's cookie, and anyone holding
+   it could pass as that student.
 
 HOW TO RUN:
-    source venv/bin/activate
-    TEACHER_PASSWORD=your-password uvicorn main:app --reload
+    DATABASE_URL="postgresql://..." uvicorn main:app --reload
 
-The app refuses to serve teacher pages if TEACHER_PASSWORD is not set.
-Failing closed is deliberate: a missing password must not silently mean
-"no password".
+Optional: TEACHER_SIGNUP_CODE="..." makes new teacher accounts require that
+code, so a stranger who finds the site cannot open an account.
+
+The app refuses to start without DATABASE_URL. Failing closed is deliberate:
+a missing database must not silently mean "keep everything in memory".
 """
 
 import csv
-import hmac
+import html
 import io
+import json
 import os
+import re
 import secrets
-import sqlite3
+import unicodedata
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import bcrypt
+import psycopg
 import qrcode
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
+from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
+                               Response, StreamingResponse)
+from psycopg.rows import dict_row
 
 # ---------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------
 
-DB_PATH = "unipresence.db"
-ROSTER_PATH = "roster.csv"
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+# Version 2 keeps its tables in their own Postgres schema. If the version 1
+# tables were already created in the same Neon database, they stay untouched
+# and the two never collide.
+SCHEMA = "unipresence_v2"
+
 LOCAL_TZ = ZoneInfo("America/Bogota")
 
-# How long each attendance QR stays valid.
-# Design decision: shorter makes relaying over WhatsApp harder; longer is
-# easier for someone sitting at the back of a large lecture hall.
-NONCE_SECONDS = 10
+# The projected QR changes every 10 seconds, but each code stays valid for 20.
+# The extra margin is for the student at the back of a large hall whose camera
+# takes a moment to focus. It is checked at the moment of the scan.
+QR_ROTATE_SECONDS = 10
+NONCE_VALID_SECONDS = 20
 
-# Read from the environment, never hardcoded. This repository is public:
-# a password written in the source is a password everyone has.
-TEACHER_PASSWORD = os.environ.get("TEACHER_PASSWORD", "")
+# After a valid scan, the student has this long to tap Aceptar or type the
+# carne. Typing is slow; version 1 learned on day 1 that a code expiring while
+# someone types is a dead end.
+TICKET_SECONDS = 180
 
-# Valid teacher session tokens, kept in memory.
-# Restarting the server logs the teacher out, which is acceptable here.
-# Tokens are random, so they reveal nothing about the password.
-TEACHER_SESSIONS = set()
+TEACHER_SESSION_HOURS = 12
+SIGNUP_CODE = os.environ.get("TEACHER_SIGNUP_CODE", "")
+DEFAULT_LATE_MINUTES = 15
+
+# "Several new phones linked in a few seconds from the same browser and
+# system" is one of the review signals. These are its two thresholds.
+BURST_WINDOW_SECONDS = 60
+BURST_COUNT = 3
+
+# Same alphabet as generate_codes.py: no 0/O, no 1/I/L.
+RECEIPT_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
 app = FastAPI(title="UniPresence")
 
@@ -94,613 +120,1475 @@ app = FastAPI(title="UniPresence")
 # DATABASE
 # ---------------------------------------------------------------
 
-def connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+@contextmanager
+def db():
+    """
+    One request, one transaction.
+
+    Neon's connection pooler hands a different server connection to each
+    transaction, so a plain `SET search_path` could be lost between
+    statements. `SET LOCAL` lives exactly as long as this transaction, which
+    is why nothing inside a request commits halfway through.
+
+    prepare_threshold=None turns off server-side prepared statements, which
+    a transaction pooler cannot keep between transactions.
+    """
+    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row,
+                           prepare_threshold=None)
+    try:
+        conn.execute(f"SET LOCAL search_path TO {SCHEMA}, public")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS teachers (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email         TEXT NOT NULL UNIQUE,
+    name          TEXT NOT NULL,
+    institution   TEXT NOT NULL DEFAULT '',
+    password_hash TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Kept in the database, not in memory, so a restart no longer logs the
+-- professor out in the middle of a class.
+CREATE TABLE IF NOT EXISTS teacher_sessions (
+    token      TEXT PRIMARY KEY,
+    teacher_id BIGINT NOT NULL REFERENCES teachers(id) ON DELETE CASCADE,
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS courses (
+    id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    teacher_id   BIGINT NOT NULL REFERENCES teachers(id) ON DELETE CASCADE,
+    name         TEXT NOT NULL,
+    has_roster   BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at TIMESTAMPTZ
+);
+
+-- One row per person, identified by carne, shared by every class. A student
+-- in six classes links a phone once, not six times.
+-- device_id stays NULL until the student links a browser. Postgres allows
+-- several NULLs in a UNIQUE column.
+CREATE TABLE IF NOT EXISTS students (
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    carne         TEXT NOT NULL UNIQUE,
+    name          TEXT NOT NULL,
+    device_id     TEXT UNIQUE,
+    device_no     INTEGER NOT NULL DEFAULT 0,
+    registered_at TIMESTAMPTZ
+);
+
+-- Who belongs to which class. 'pendiente' is a student who joined a class
+-- with no list by checking in, and is waiting for the professor's approval.
+CREATE TABLE IF NOT EXISTS enrollments (
+    course_id  BIGINT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+    student_id BIGINT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    status     TEXT NOT NULL CHECK (status IN ('aprobado', 'pendiente')),
+    section    TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (course_id, student_id)
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    course_id  BIGINT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at   TIMESTAMPTZ,
+    active     BOOLEAN NOT NULL DEFAULT TRUE,
+    sections   TEXT[]
+);
+
+CREATE TABLE IF NOT EXISTS nonces (
+    nonce      TEXT PRIMARY KEY,
+    session_id BIGINT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+-- A valid scan becomes a one-use ticket. The nonce is checked when the
+-- student scans; the ticket carries that result to the Aceptar button.
+CREATE TABLE IF NOT EXISTS scan_tickets (
+    token      TEXT PRIMARY KEY,
+    session_id BIGINT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    scanned_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    used_at    TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS attendance (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    session_id BIGINT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    student_id BIGINT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    marked_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    method     TEXT NOT NULL,
+    receipt    TEXT NOT NULL UNIQUE,
+    browser    TEXT,
+    os         TEXT,
+    in_app     TEXT,
+    device_no  INTEGER,
+    UNIQUE (session_id, student_id)
+);
+
+-- Every time a carne moves to a different browser or phone. Re-linking is
+-- allowed so that a present student is never locked out, as 7 were in the
+-- pilot; writing down every move is what keeps that visible.
+CREATE TABLE IF NOT EXISTS device_changes (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    student_id BIGINT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    old_device TEXT,
+    new_device TEXT NOT NULL,
+    session_id BIGINT REFERENCES sessions(id) ON DELETE SET NULL,
+    changed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Everything worth knowing that is not an attendance row: links, moves,
+-- blocked attempts, expired scans. `review` marks what goes under
+-- "Por revisar".
+CREATE TABLE IF NOT EXISTS events (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    session_id BIGINT REFERENCES sessions(id) ON DELETE CASCADE,
+    student_id BIGINT REFERENCES students(id) ON DELETE SET NULL,
+    kind       TEXT NOT NULL,
+    detail     TEXT NOT NULL DEFAULT '',
+    review     BOOLEAN NOT NULL DEFAULT FALSE,
+    browser    TEXT,
+    os         TEXT,
+    in_app     TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+
+# Columns added after the first deploy of version 2. ADD COLUMN IF NOT EXISTS
+# upgrades a database created earlier without touching its data.
+UPGRADE_SQL = """
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS section TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS sections TEXT[];
+"""
 
 
 def init_db():
-    conn = connect()
-    c = conn.cursor()
-
-    # Students come from the course roster; they are not created on the fly.
-    # device_id stays NULL until the person registers their phone.
-    # SQLite allows several NULLs in a UNIQUE column, so this works.
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS students (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            student_code     TEXT NOT NULL UNIQUE,
-            name             TEXT NOT NULL,
-            device_id        TEXT UNIQUE,
-            registered_at    TEXT,
-            registered_where TEXT
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            course_name TEXT NOT NULL,
-            started_at  TEXT NOT NULL,
-            ended_at    TEXT,
-            active      INTEGER NOT NULL DEFAULT 1
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS nonces (
-            nonce      TEXT PRIMARY KEY,
-            session_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL,
-            used_by    TEXT
-        )
-    """)
-
-    # Every time a roster code moves to a different browser or phone.
-    #
-    # This table is the price of letting students re-bind. Re-binding keeps
-    # present students from being locked out, but it also means a leaked code
-    # can be moved by whoever holds it. Writing every move down is what keeps
-    # that visible instead of invisible.
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS device_changes (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            student_id INTEGER NOT NULL,
-            old_device TEXT,
-            new_device TEXT NOT NULL,
-            changed_at TEXT NOT NULL,
-            session_id INTEGER
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS attendance (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id INTEGER NOT NULL,
-            student_id INTEGER NOT NULL,
-            timestamp  TEXT NOT NULL,
-            method     TEXT NOT NULL,
-            nonce_used TEXT,
-            UNIQUE(session_id, student_id)
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-def load_roster():
-    """
-    Read roster.csv and insert any students that are missing.
-
-    The CSV headers stay in Spanish because that file is maintained by the
-    professor, not by the developer.
-
-    INSERT OR IGNORE means: if the code already exists, do nothing. The
-    server can restart without wiping existing registrations, and new
-    students can be appended to the file without breaking anything.
-    """
-    if not os.path.exists(ROSTER_PATH):
-        print(f"WARNING: {ROSTER_PATH} not found. No course roster loaded.")
-        return
-
-    conn = connect()
-    added = 0
-    with open(ROSTER_PATH, encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            code = (row.get("codigo") or "").strip()
-            name = (row.get("nombre") or "").strip()
-            if not code or not name:
-                continue
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO students (student_code, name) VALUES (?, ?)",
-                (code, name),
-            )
-            added += cur.rowcount
-    conn.commit()
-    conn.close()
-    print(f"Course roster loaded. New students: {added}")
+    with db() as conn:
+        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
+        conn.execute(SCHEMA_SQL)
+        conn.execute(UPGRADE_SQL)
 
 
 @app.on_event("startup")
 def on_startup():
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is not set. UniPresence v2 stores everything in "
+            "Postgres; without it, attendance would vanish on the next restart."
+        )
     init_db()
-    load_roster()
-    if not TEACHER_PASSWORD:
-        print("WARNING: TEACHER_PASSWORD is not set. Teacher pages are disabled.")
 
 
-def now():
-    return datetime.now(timezone.utc).isoformat()
+def utcnow():
+    return datetime.now(timezone.utc)
 
 
-def to_local(iso_text: str | None) -> str:
-    """UTC on disk, Bogota on screen. Storing UTC is correct; showing it is not."""
-    if not iso_text:
+def local(dt) -> str:
+    """UTC on disk, Bogota on screen."""
+    if not dt:
         return ""
-    return (datetime.fromisoformat(iso_text)
-            .astimezone(LOCAL_TZ)
-            .strftime("%Y-%m-%d %H:%M"))
+    return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
 
 
-# ---------------------------------------------------------------
-# BINDING A CODE TO A BROWSER
-#
-# One function for all three paths that need it: registering for the first
-# time, re-binding from the registration page, and re-binding in the middle
-# of a check-in. They used to be three different pieces of logic, which is
-# how the pilot ended up with two screens that contradicted each other.
-# ---------------------------------------------------------------
+def local_time(dt) -> str:
+    if not dt:
+        return ""
+    return dt.astimezone(LOCAL_TZ).strftime("%H:%M:%S")
 
-def bind_device(conn, student, device_id: str, session_id: int | None):
+
+def e(text) -> str:
     """
-    Point a roster code at this browser.
+    Escape everything that reaches a page.
 
-    Returns (status, extra):
-        "ok"      first binding
-        "moved"   taken from another browser, logged in device_changes
-        "same"    already this browser, nothing to do
-        "taken"   this browser already belongs to another student (extra=row)
-        "retry"   someone else changed it while we were working
+    Version 1 put roster names straight into HTML. That was tolerable while
+    the professor wrote the roster; now students type their own names, and a
+    "name" containing a <script> tag would run on the professor's screen.
+    """
+    return html.escape("" if text is None else str(text))
+
+
+# ---------------------------------------------------------------
+# BROWSER, SYSTEM AND APP
+#
+# Three words per check-in, read from the User-Agent header. The full header
+# is never stored: combined with other details it can help single out one
+# phone, which goes against the privacy design of the project.
+#
+# Detection is best effort. WhatsApp on iPhone opens links in a Safari view
+# that looks exactly like Safari, so it cannot be told apart.
+# ---------------------------------------------------------------
+
+def parse_ua(ua: str) -> dict:
+    ua = ua or ""
+    if re.search(r"iPhone|iPad|iPod", ua):
+        system = "iOS"
+    elif "Android" in ua:
+        system = "Android"
+    elif "Windows" in ua:
+        system = "Windows"
+    elif "Macintosh" in ua or "Mac OS X" in ua:
+        system = "macOS"
+    elif "Linux" in ua:
+        system = "Linux"
+    else:
+        system = "Otro"
+
+    in_app = ""
+    if "Instagram" in ua:
+        in_app = "Instagram"
+    elif re.search(r"FBAN|FBAV|FB_IAB", ua):
+        in_app = "Facebook"
+    elif "WhatsApp" in ua:
+        in_app = "WhatsApp"
+    elif "; wv)" in ua:
+        in_app = "App (WebView)"
+
+    if "SamsungBrowser" in ua:
+        browser = "Samsung Internet"
+    elif re.search(r"EdgA|EdgiOS|Edg/", ua):
+        browser = "Edge"
+    elif re.search(r"FxiOS|Firefox", ua):
+        browser = "Firefox"
+    elif re.search(r"CriOS|Chrome", ua):
+        browser = "Chrome"
+    elif "Safari" in ua:
+        browser = "Safari"
+    else:
+        browser = "Otro"
+
+    return {"browser": browser, "os": system, "in_app": in_app}
+
+
+def ua_of(request: Request) -> dict:
+    return parse_ua(request.headers.get("user-agent", ""))
+
+
+def ua_text(ua: dict) -> str:
+    text = f"{ua['browser']} · {ua['os']}"
+    return text + (f" · desde {ua['in_app']}" if ua.get("in_app") else "")
+
+
+# ---------------------------------------------------------------
+# EVENTS
+# ---------------------------------------------------------------
+
+EVENT_LABELS = {
+    "vinculacion": "Vinculó este celular durante la clase",
+    "cambio_dispositivo": "Su carné pasó a otro navegador o celular durante la clase",
+    "rafaga": "Varias vinculaciones seguidas desde el mismo navegador y sistema",
+    "desde_app": "Abrió el enlace dentro de una app",
+    "carne_no_en_lista": "Intentó marcar con un carné que no está en la lista",
+    "qr_vencido": "Escaneó un QR vencido",
+    "manual": "Marcado a mano por el profesor",
+}
+
+
+def log_event(conn, session_id, student_id, kind, detail="", review=False, ua=None):
+    ua = ua or {}
+    conn.execute(
+        "INSERT INTO events (session_id, student_id, kind, detail, review, "
+        "browser, os, in_app) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        (session_id, student_id, kind, detail, review,
+         ua.get("browser"), ua.get("os"), ua.get("in_app")),
+    )
+
+
+def check_burst(conn, session_id, ua):
+    """
+    Three or more new links within a minute, all from the same browser and
+    system, during one class.
+
+    On its own this proves nothing: half a class can own the same iPhone
+    model. It is the shape someone typing classmates' carnes into fresh
+    private windows would leave behind, so it goes under "Por revisar".
+    """
+    since = utcnow() - timedelta(seconds=BURST_WINDOW_SECONDS)
+    n = conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE session_id = %s "
+        "AND kind = 'vinculacion' AND created_at >= %s "
+        "AND browser = %s AND os = %s",
+        (session_id, since, ua["browser"], ua["os"]),
+    ).fetchone()["n"]
+    if n < BURST_COUNT:
+        return
+    already = conn.execute(
+        "SELECT 1 FROM events WHERE session_id = %s AND kind = 'rafaga' "
+        "AND created_at >= %s AND browser = %s AND os = %s",
+        (session_id, since, ua["browser"], ua["os"]),
+    ).fetchone()
+    if not already:
+        log_event(conn, session_id, None, "rafaga",
+                  f"{n} celulares nuevos en menos de {BURST_WINDOW_SECONDS} s "
+                  f"con {ua['browser']} en {ua['os']}", True, ua)
+
+
+# ---------------------------------------------------------------
+# LINKING A CARNE TO A BROWSER
+# ---------------------------------------------------------------
+
+class RetryNeeded(Exception):
+    """Someone changed the same row at the same instant."""
+
+
+def bind_device(conn, student, device_id: str, session_id):
+    """
+    Point a carne at this browser.
+
+    Returns:
+        "ok"     first link for this carne
+        "moved"  taken from another browser, written to device_changes
+        "same"   already this browser
+        "taken"  this browser already belongs to another student
+    Raises RetryNeeded if the row changed while we were working.
     """
     owner = conn.execute(
-        "SELECT * FROM students WHERE device_id = ?", (device_id,)
+        "SELECT id FROM students WHERE device_id = %s", (device_id,)
     ).fetchone()
     if owner and owner["id"] != student["id"]:
-        # The one rule that does not bend: a phone is one student's phone.
-        # Without this, two people share a handset and both get marked.
-        return "taken", owner
+        # The one rule that does not bend: a browser marks for one person.
+        return "taken"
 
     previous = student["device_id"]
     if previous == device_id:
-        return "same", None
+        return "same"
 
-    active = conn.execute(
-        "SELECT id FROM sessions WHERE active = 1 ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    where = "aula" if active else "pre"
-
-    # `device_id IS ?` holds the old value, NULL included, so the write only
-    # lands if nothing changed since we read the row. Two people confirming
-    # the same code at the same instant still produces exactly one winner.
+    # The WHERE clause carries the value we read, NULL included, so the write
+    # only lands if nothing changed since. Two people linking the same carne
+    # at the same instant still produce exactly one winner.
     cur = conn.execute(
-        "UPDATE students SET device_id = ?, "
-        "registered_at = COALESCE(registered_at, ?), "
-        "registered_where = COALESCE(registered_where, ?) "
-        "WHERE id = ? AND device_id IS ?",
-        (device_id, now(), where, student["id"], previous),
+        "UPDATE students SET device_id = %s, device_no = device_no + 1, "
+        "registered_at = COALESCE(registered_at, now()) "
+        "WHERE id = %s AND device_id IS NOT DISTINCT FROM %s",
+        (device_id, student["id"], previous),
     )
     if cur.rowcount == 0:
-        conn.rollback()
-        return "retry", None
+        raise RetryNeeded()
 
     if previous:
         conn.execute(
-            "INSERT INTO device_changes "
-            "(student_id, old_device, new_device, changed_at, session_id) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (student["id"], previous, device_id, now(), session_id),
+            "INSERT INTO device_changes (student_id, old_device, new_device, session_id) "
+            "VALUES (%s, %s, %s, %s)",
+            (student["id"], previous, device_id, session_id),
         )
+        return "moved"
+    return "ok"
 
-    conn.commit()
-    return ("moved" if previous else "ok"), None
+
+def make_receipt(conn, course_id: int) -> str:
+    day = utcnow().astimezone(LOCAL_TZ).strftime("%m%d")
+    while True:
+        tail = "".join(secrets.choice(RECEIPT_ALPHABET) for _ in range(4))
+        code = f"C{course_id}-{day}-{tail}"
+        if not conn.execute("SELECT 1 FROM attendance WHERE receipt = %s",
+                            (code,)).fetchone():
+            return code
+
+
+def record_attendance(conn, session, student, method, ua=None):
+    """
+    Returns (attendance_row, created). A second check-in by the same student
+    in the same class creates nothing and returns the first one.
+    """
+    ua = ua or {}
+    row = conn.execute(
+        "INSERT INTO attendance (session_id, student_id, method, receipt, "
+        "browser, os, in_app, device_no) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (session_id, student_id) DO NOTHING RETURNING *",
+        (session["id"], student["id"], method,
+         make_receipt(conn, session["course_id"]),
+         ua.get("browser"), ua.get("os"), ua.get("in_app"),
+         student.get("device_no") if method == "qr" else None),
+    ).fetchone()
+    if row:
+        return row, True
+    row = conn.execute(
+        "SELECT * FROM attendance WHERE session_id = %s AND student_id = %s",
+        (session["id"], student["id"]),
+    ).fetchone()
+    return row, False
+
+
+def enrollment(conn, course_id, student_id):
+    return conn.execute(
+        "SELECT * FROM enrollments WHERE course_id = %s AND student_id = %s",
+        (course_id, student_id),
+    ).fetchone()
+
+
+def normalize_carne(value) -> str:
+    """Excel turns 2021104567 into 2021104567.0 and likes leading apostrophes."""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    text = str(value or "").strip().lstrip("'")
+    return re.sub(r"\s+", "", text).upper()
 
 
 # ---------------------------------------------------------------
-# TEACHER AUTHENTICATION
+# TEACHER ACCOUNTS
 #
-# Student-facing pages stay open: a student has no account and must be able
-# to register and check in with nothing but a phone. Everything the teacher
-# touches is behind this gate.
+# Version 1 had one shared password, so nobody could tell which person had
+# marked a student by hand. Each professor now has an account.
 # ---------------------------------------------------------------
 
-def is_teacher(request: Request) -> bool:
+class NeedLogin(Exception):
+    pass
+
+
+@app.exception_handler(NeedLogin)
+def need_login(request: Request, exc: NeedLogin):
+    if request.url.path.endswith("/state"):
+        return JSONResponse({"error": "login"}, status_code=401)
+    return RedirectResponse("/login", status_code=303)
+
+
+@app.exception_handler(RetryNeeded)
+def retry_needed(request: Request, exc: RetryNeeded):
+    return HTMLResponse(student_page(
+        "<p class='bad-title'>Inténtalo otra vez</p>"
+        "<p>Alguien usó ese carné en el mismo instante. Vuelve a escanear el QR.</p>"
+    ))
+
+
+@app.exception_handler(psycopg.errors.UniqueViolation)
+def unique_violation(request: Request, exc):
+    return HTMLResponse(student_page(
+        "<p class='bad-title'>Inténtalo otra vez</p>"
+        "<p>Dos registros chocaron al mismo tiempo. Vuelve a escanear el QR.</p>"
+    ))
+
+
+def current_teacher(request: Request, conn):
     token = request.cookies.get("teacher_session")
-    return bool(token) and token in TEACHER_SESSIONS
+    if not token:
+        return None
+    return conn.execute(
+        "SELECT t.* FROM teacher_sessions s JOIN teachers t ON t.id = s.teacher_id "
+        "WHERE s.token = %s AND s.expires_at > now()",
+        (token,),
+    ).fetchone()
 
 
-def wrap(body: str) -> str:
-    """Wrap a fragment in the shared student-facing page shell."""
-    return f"""
-<!DOCTYPE html>
-<html lang="es">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>UniPresence</title>
-<style>
-  body {{ font-family: -apple-system, sans-serif; padding: 40px 24px; text-align: center; }}
-  .ok {{ color: #1a7f37; font-size: 28px; font-weight: bold; }}
-  .error {{ color: #b91c1c; font-size: 24px; font-weight: bold; }}
-  .name {{ font-size: 30px; font-weight: bold; margin: 20px 0; }}
-  input, button {{ font-size: 20px; padding: 12px; width: 100%; box-sizing: border-box; margin: 8px 0; }}
-  button {{ background: #1a7f37; color: white; border: none; border-radius: 8px; }}
-  button.grey {{ background: #666; }}
-  a.link-button {{ display: block; background: #1a7f37; color: white; padding: 16px;
-                   text-decoration: none; border-radius: 8px; margin-top: 16px; font-size: 20px; }}
-  form {{ max-width: 420px; margin: 0 auto; }}
-  table {{ margin: 0 auto; border-collapse: collapse; }}
-  th, td {{ padding: 10px 16px; border-bottom: 1px solid #ddd; text-align: left; }}
-  th {{ color: #555; font-weight: normal; }}
-</style>
-</head>
-<body>{body}</body>
-</html>
+def require_teacher(request: Request, conn):
+    teacher = current_teacher(request, conn)
+    if not teacher:
+        raise NeedLogin()
+    return teacher
+
+
+def own_course(conn, teacher, course_id):
+    course = conn.execute(
+        "SELECT * FROM courses WHERE id = %s AND teacher_id = %s",
+        (course_id, teacher["id"]),
+    ).fetchone()
+    if not course:
+        # Another professor's class looks exactly like one that does not exist.
+        raise NeedLogin()
+    return course
+
+
+def own_session(conn, teacher, session_id):
+    session = conn.execute(
+        "SELECT s.*, c.name AS course_name, c.has_roster, c.teacher_id "
+        "FROM sessions s JOIN courses c ON c.id = s.course_id "
+        "WHERE s.id = %s AND c.teacher_id = %s",
+        (session_id, teacher["id"]),
+    ).fetchone()
+    if not session:
+        raise NeedLogin()
+    return session
+
+
+def start_teacher_session(conn, teacher_id) -> Response:
+    token = secrets.token_urlsafe(32)
+    conn.execute(
+        "INSERT INTO teacher_sessions (token, teacher_id, expires_at) VALUES (%s, %s, %s)",
+        (token, teacher_id, utcnow() + timedelta(hours=TEACHER_SESSION_HOURS)),
+    )
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie("teacher_session", token,
+                        max_age=TEACHER_SESSION_HOURS * 3600,
+                        httponly=True, samesite="lax")
+    return response
+
+
+# A real bcrypt hash of a random string. Checking a wrong email against it
+# takes as long as checking a real one, so response time does not reveal
+# which emails have accounts.
+_DUMMY_HASH = bcrypt.hashpw(b"unipresence-dummy", bcrypt.gensalt()).decode()
+
+
+# ---------------------------------------------------------------
+# PAGE SHELLS
+# ---------------------------------------------------------------
+
+BASE_CSS = """
+:root { --bg:#f2f5f7; --card:#fff; --ink:#15212e; --muted:#5a6876; --line:#d6dde4;
+        --ok:#18794e; --ok-soft:#e3f4ec; --bad:#b42318; --bad-soft:#fdecea;
+        --warn:#a15c07; --warn-soft:#fdf3e1; --accent:#1f5f8b; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--ink);
+       font:16px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif; }
+a { color:var(--accent); }
+.wrap { max-width:1000px; margin:0 auto; padding:20px 16px 60px; }
+header.bar { background:var(--card); border-bottom:1px solid var(--line); }
+header.bar .wrap { padding-block:12px; display:flex; gap:16px; align-items:center;
+                   justify-content:space-between; flex-wrap:wrap; }
+.brand { font-weight:700; font-size:18px; text-decoration:none; color:var(--ink); }
+nav { display:flex; gap:16px; align-items:center; font-size:15px; color:var(--muted); }
+h1 { font-size:26px; margin:8px 0 16px; }
+h2 { font-size:19px; margin:28px 0 10px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(260px, 1fr)); gap:14px; }
+.btn { display:inline-block; background:var(--ok); color:#fff; border:0; border-radius:8px;
+       padding:11px 18px; font-size:16px; font-weight:600; text-decoration:none; cursor:pointer; }
+.btn.big { padding:16px 24px; font-size:19px; width:100%; text-align:center; }
+.btn.grey { background:#5a6876; }
+.btn.red { background:var(--bad); }
+.btn.light { background:var(--ok-soft); color:var(--ok); }
+.btn.small { padding:6px 12px; font-size:14px; }
+input, textarea, select { font:inherit; width:100%; padding:11px 12px; border:1px solid var(--line);
+       border-radius:8px; background:#fff; color:var(--ink); }
+textarea { min-height:150px; font-family:ui-monospace, Menlo, monospace; font-size:14px; }
+label { display:block; font-weight:600; margin:14px 0 6px; }
+.hint { color:var(--muted); font-size:14px; margin:4px 0 0; }
+.msg { padding:12px 14px; border-radius:8px; margin:12px 0; }
+.msg.bad { background:var(--bad-soft); color:var(--bad); }
+.msg.ok { background:var(--ok-soft); color:var(--ok); }
+.msg.warn { background:var(--warn-soft); color:var(--warn); }
+.table-wrap { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; background:var(--card); font-size:14px; }
+th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+.pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:600; }
+.pill.ok { background:var(--ok-soft); color:var(--ok); }
+.pill.bad { background:var(--bad-soft); color:var(--bad); }
+.pill.warn { background:var(--warn-soft); color:var(--warn); }
+.pill.grey { background:#e8edf1; color:var(--muted); }
+.muted { color:var(--muted); }
+form.inline { display:inline; }
 """
+
+
+def teacher_page(title: str, body: str, teacher=None) -> str:
+    nav = ""
+    if teacher:
+        nav = (f"<nav><a href='/'>Mis clases</a><span>{e(teacher['name'])}</span>"
+               f"<a href='/logout'>Salir</a></nav>")
+    return f"""<!DOCTYPE html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{e(title)} · UniPresence</title><style>{BASE_CSS}</style></head>
+<body><header class="bar"><div class="wrap"><a class="brand" href="/">UniPresence</a>{nav}</div></header>
+<main class="wrap">{body}</main></body></html>"""
+
+
+STUDENT_CSS = """
+body { background:var(--bg); }
+.s { max-width:440px; margin:0 auto; padding:28px 18px 48px; text-align:center; }
+.course { font-size:26px; font-weight:700; margin:6px 0 2px; }
+.prof { color:var(--muted); margin:0 0 18px; }
+.name { font-size:28px; font-weight:700; margin:14px 0 2px; }
+.carne { color:var(--muted); margin:0 0 20px; }
+.s form { text-align:left; }
+.bad-title { color:var(--bad); font-size:24px; font-weight:700; margin:24px 0 8px; }
+.okscreen { position:fixed; inset:0; background:var(--ok); color:#fff; display:flex;
+            align-items:center; justify-content:center; text-align:center; padding:24px; }
+.okscreen .inner { max-width:440px; width:100%; }
+.check { width:96px; height:96px; border-radius:50%; background:#fff; color:var(--ok);
+         font-size:60px; line-height:96px; margin:0 auto 14px; font-weight:700; }
+.oktitle { font-size:30px; font-weight:800; margin:0 0 14px; }
+.okscreen .name { color:#fff; }
+.okline { font-size:17px; margin:2px 0; opacity:.95; }
+.clock { font-size:44px; font-weight:800; font-variant-numeric:tabular-nums; margin:16px 0 4px; }
+.live { display:inline-flex; align-items:center; gap:8px; font-size:14px; opacity:.9; }
+.dot { width:10px; height:10px; border-radius:50%; background:#fff; animation:pulse 1s infinite; }
+@keyframes pulse { 50% { opacity:.25; } }
+.receipt { margin-top:18px; background:rgba(255,255,255,.16); border-radius:10px; padding:12px; }
+.receipt b { font-size:24px; letter-spacing:2px; font-family:ui-monospace, Menlo, monospace; }
+"""
+
+
+def student_page(body: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UniPresence</title><style>{BASE_CSS}{STUDENT_CSS}</style></head>
+<body><div class="s">{body}</div></body></html>"""
+
+
+# ---------------------------------------------------------------
+# SIGN UP, LOG IN
+# ---------------------------------------------------------------
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page(error: str = ""):
-    if not TEACHER_PASSWORD:
-        return wrap(
-            "<p class='error'>Configuracion incompleta</p>"
-            "<p>El servidor no tiene contrasena configurada.</p>"
-        )
-    warning = "<p class='error'>Contrasena incorrecta</p>" if error else ""
-    return wrap(f"""
-        {warning}
-        <h2>UniPresence</h2>
-        <p>Pantalla del profesor</p>
+    msg = "<div class='msg bad'>Correo o contraseña incorrectos.</div>" if error else ""
+    return teacher_page("Entrar", f"""
+      <div class="card" style="max-width:420px;margin:30px auto">
+        <h1>Entrar</h1>{msg}
         <form method="post" action="/login">
-          <input type="password" name="password" placeholder="Contrasena" required autofocus>
-          <button type="submit">Entrar</button>
+          <label for="email">Correo</label>
+          <input id="email" name="email" type="email" required autofocus>
+          <label for="password">Contraseña</label>
+          <input id="password" name="password" type="password" required>
+          <p style="margin-top:18px"><button class="btn big" type="submit">Entrar</button></p>
         </form>
-    """)
+        <p class="hint">¿Primera vez? <a href="/signup">Crea tu cuenta de profesor</a>.</p>
+      </div>""")
 
 
 @app.post("/login")
-def do_login(password: str = Form(...)):
-    # compare_digest instead of == : it takes the same time whether the
-    # first character is wrong or only the last one, so an attacker cannot
-    # guess the password one character at a time by measuring responses.
-    if not TEACHER_PASSWORD or not hmac.compare_digest(password, TEACHER_PASSWORD):
-        return RedirectResponse("/login?error=1", status_code=303)
+def do_login(email: str = Form(...), password: str = Form(...)):
+    with db() as conn:
+        teacher = conn.execute("SELECT * FROM teachers WHERE email = %s",
+                               (email.strip().lower(),)).fetchone()
+        stored = teacher["password_hash"] if teacher else _DUMMY_HASH
+        valid = bcrypt.checkpw(password.encode(), stored.encode())
+        if not teacher or not valid:
+            return RedirectResponse("/login?error=1", status_code=303)
+        return start_teacher_session(conn, teacher["id"])
 
-    token = secrets.token_urlsafe(32)
-    TEACHER_SESSIONS.add(token)
 
-    response = RedirectResponse("/", status_code=303)
-    response.set_cookie("teacher_session", token, max_age=43200,
-                        httponly=True, samesite="lax")
-    return response
+@app.get("/signup", response_class=HTMLResponse)
+def signup_page(error: str = ""):
+    msg = f"<div class='msg bad'>{e(error)}</div>" if error else ""
+    code_field = ""
+    if SIGNUP_CODE:
+        code_field = """<label for="code">Código de invitación</label>
+          <input id="code" name="code" required>"""
+    return teacher_page("Crear cuenta", f"""
+      <div class="card" style="max-width:460px;margin:30px auto">
+        <h1>Cuenta de profesor</h1>{msg}
+        <form method="post" action="/signup">
+          <label for="name">Nombre</label>
+          <input id="name" name="name" required maxlength="80" placeholder="Prof. María Pérez">
+          <label for="institution">Institución <span class="muted">(opcional)</span></label>
+          <input id="institution" name="institution" maxlength="120" placeholder="Universidad del Norte">
+          <label for="email">Correo</label>
+          <input id="email" name="email" type="email" required>
+          <label for="password">Contraseña</label>
+          <input id="password" name="password" type="password" required minlength="8">
+          <p class="hint">Mínimo 8 caracteres. No uses la misma de la universidad.</p>
+          {code_field}
+          <p style="margin-top:18px"><button class="btn big" type="submit">Crear cuenta</button></p>
+        </form>
+        <p class="hint">¿Ya tienes cuenta? <a href="/login">Entra aquí</a>.</p>
+      </div>""")
+
+
+@app.post("/signup")
+def do_signup(name: str = Form(...), email: str = Form(...), password: str = Form(...),
+              institution: str = Form(""), code: str = Form("")):
+    email = email.strip().lower()
+    if SIGNUP_CODE and not secrets.compare_digest(code.strip(), SIGNUP_CODE):
+        return RedirectResponse("/signup?error=Código+de+invitación+incorrecto", status_code=303)
+    if len(password) < 8:
+        return RedirectResponse("/signup?error=La+contraseña+necesita+8+caracteres", status_code=303)
+    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    with db() as conn:
+        row = conn.execute(
+            "INSERT INTO teachers (email, name, institution, password_hash) "
+            "VALUES (%s, %s, %s, %s) ON CONFLICT (email) DO NOTHING RETURNING id",
+            (email, name.strip()[:80], institution.strip()[:120], hashed),
+        ).fetchone()
+        if not row:
+            return RedirectResponse("/signup?error=Ya+existe+una+cuenta+con+ese+correo", status_code=303)
+        return start_teacher_session(conn, row["id"])
 
 
 @app.get("/logout")
 def logout(request: Request):
     token = request.cookies.get("teacher_session")
-    TEACHER_SESSIONS.discard(token)
+    if token:
+        with db() as conn:
+            conn.execute("DELETE FROM teacher_sessions WHERE token = %s", (token,))
     response = RedirectResponse("/login", status_code=303)
     response.delete_cookie("teacher_session")
     return response
 
 
 # ---------------------------------------------------------------
-# TEACHER SCREEN
+# CLASSES
 # ---------------------------------------------------------------
 
-TEACHER_PAGE = """
-<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="utf-8">
-  <title>UniPresence</title>
-  <style>
-    body { font-family: -apple-system, sans-serif; text-align: center; padding: 30px; }
-    #qr { width: 380px; height: 380px; }
-    #count { font-size: 60px; font-weight: bold; margin: 12px; }
-    #finalCount { font-size: 60px; font-weight: bold; margin: 12px; }
-    button { font-size: 22px; padding: 14px 28px; cursor: pointer; margin: 6px; }
-    button.end { background: #b91c1c; color: white; border: none; border-radius: 8px; }
-    .row { display: flex; justify-content: center; gap: 40px; align-items: flex-start; }
-    .panel { text-align: center; }
-    h3 { color: #555; font-weight: normal; }
-    .logout { position: absolute; top: 16px; right: 24px; font-size: 14px; color: #888; }
-    .warn { color: #b91c1c; max-width: 480px; margin: 16px auto; }
-  </style>
-</head>
-<body>
-  <a class="logout" href="/logout">Salir</a>
-  <h1>UniPresence</h1>
+@app.get("/", response_class=HTMLResponse)
+def home(request: Request):
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        courses = conn.execute("""
+            SELECT c.*,
+                   (SELECT COUNT(*) FROM enrollments en WHERE en.course_id = c.id) AS students,
+                   (SELECT COUNT(*) FROM enrollments en WHERE en.course_id = c.id
+                       AND en.status = 'pendiente') AS pending,
+                   (SELECT id FROM sessions s WHERE s.course_id = c.id AND s.active
+                       ORDER BY id DESC LIMIT 1) AS live_session
+            FROM courses c WHERE c.teacher_id = %s
+            ORDER BY c.last_used_at DESC NULLS LAST, c.created_at DESC
+        """, (teacher["id"],)).fetchall()
 
-  <div id="before">
-    <button onclick="startSession()">Iniciar asistencia</button>
-    <p><a href="/qr-register-page">Mostrar QR de registro</a></p>
-    <p><a href="/sessions">Ver clases anteriores</a></p>
-  </div>
+    cards = []
+    for c in courses:
+        list_note = "con lista" if c["has_roster"] else "sin lista: se arma con quienes marquen"
+        pending = (f" · <span class='pill warn'>{c['pending']} por aprobar</span>"
+                   if c["pending"] else "")
+        if c["live_session"]:
+            action = (f"<a class='btn big' href='/session/{c['live_session']}/live'>"
+                      f"Volver a la asistencia en curso</a>")
+        else:
+            action = (f"<form method='post' action='/course/{c['id']}/start'>"
+                      f"<button class='btn big' type='submit'>Tomar asistencia</button></form>")
+        cards.append(f"""
+          <div class="card">
+            <h2 style="margin-top:0">{e(c['name'])}</h2>
+            <p class="muted">{c['students']} estudiantes · {list_note}{pending}</p>
+            {action}
+            <p style="margin:12px 0 0"><a href="/course/{c['id']}">Ver lista e historial</a></p>
+          </div>""")
 
-  <div id="during" style="display:none">
-    <div class="row">
-      <div class="panel">
-        <h3>Escanea para marcar asistencia</h3>
-        <img id="qr" src="">
+    empty = ("<div class='card'><p>Todavía no tienes clases. Crea la primera: "
+             "con lista o sin lista, las dos funcionan.</p></div>")
+    return teacher_page("Mis clases", f"""
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+        <h1>Mis clases</h1><a class="btn" href="/course/new">Nueva clase</a>
       </div>
-      <div class="panel">
-        <h3>Presentes</h3>
-        <div id="count">0</div>
-        <p id="changes"></p>
-        <button onclick="downloadCsv()">Descargar CSV</button>
-        <hr>
-        <h3>Agregar manualmente</h3>
-        <input id="manualCode" placeholder="Codigo de estudiante">
-        <button onclick="addManual()">Agregar</button>
-        <p id="manualMessage"></p>
-        <hr>
-        <button class="end" onclick="endSession()">Terminar asistencia</button>
-      </div>
-    </div>
-  </div>
+      <div class="grid">{''.join(cards) or empty}</div>""", teacher)
 
-  <div id="finished" style="display:none">
-    <h2>Asistencia terminada</h2>
-    <div id="finalCount"></div>
-    <p>estudiantes presentes</p>
-    <p id="finalChanges" style="color:#b45309"></p>
-    <button onclick="downloadCsv()">Descargar CSV</button>
-    <p class="warn">Descarga el archivo ahora. En el plan gratuito de Render
-    los datos se pierden si el servicio se reinicia.</p>
-    <p><a href="/sessions">Ver clases anteriores</a> &middot; <a href="/">Volver al inicio</a></p>
-  </div>
 
-<script>
-let sessionId = null;
-let qrTimer = null;
-let countTimer = null;
-
-async function startSession() {
-  const name = prompt('Nombre de la clase', 'Genetica');
-  if (name === null) return;
-  const response = await fetch('/session/start?course_name=' +
-                               encodeURIComponent(name || 'Clase'),
-                               { method: 'POST' });
-  const data = await response.json();
-  sessionId = data.session_id;
-
-  document.getElementById('before').style.display = 'none';
-  document.getElementById('during').style.display = 'block';
-
-  refreshQR();
-  refreshCount();
-
-  // The ?t= forces the browser to fetch the image again instead of
-  // reusing the cached one.
-  qrTimer = setInterval(refreshQR, SECONDS * 1000);
-  countTimer = setInterval(refreshCount, 3000);
-}
-
-async function endSession() {
-  if (!confirm('Terminar la asistencia de esta clase?')) return;
-
-  // Stop the timers first, so nothing keeps minting nonces for a
-  // session that is already closed.
-  clearInterval(qrTimer);
-  clearInterval(countTimer);
-
-  const response = await fetch('/session/' + sessionId + '/end', { method: 'POST' });
-  const data = await response.json();
-
-  document.getElementById('during').style.display = 'none';
-  document.getElementById('finished').style.display = 'block';
-  document.getElementById('finalCount').textContent = data.count + ' de ' + data.total;
-  if (data.changes) {
-    document.getElementById('finalChanges').textContent =
-      data.changes + ' estudiante(s) cambiaron de dispositivo en esta clase';
-  }
-}
-
-function refreshQR() {
-  document.getElementById('qr').src = '/qr/' + sessionId + '?t=' + Date.now();
-}
-
-async function refreshCount() {
-  const response = await fetch('/session/' + sessionId + '/count');
-  const data = await response.json();
-  document.getElementById('count').textContent = data.count + ' de ' + data.total;
-  // Only shown when it happens. A zero on screen every class teaches the
-  // teacher to ignore the line.
-  document.getElementById('changes').textContent =
-    data.changes ? 'Cambios de dispositivo: ' + data.changes : '';
-}
-
-async function addManual() {
-  const code = document.getElementById('manualCode').value.trim();
-  if (!code) return;
-  const form = new FormData();
-  form.append('student_code', code);
-  form.append('session_id', sessionId);
-  const response = await fetch('/manual', { method: 'POST', body: form });
-  const data = await response.json();
-  document.getElementById('manualMessage').textContent = data.message;
-  document.getElementById('manualCode').value = '';
-  refreshCount();
-}
-
-function downloadCsv() {
-  window.location = '/session/' + sessionId + '/csv';
-}
-</script>
-</body>
-</html>
+ROSTER_HELP = """
+<p class="hint">Opcional. Pega desde Excel dos columnas, nombre y carné, o sube el
+archivo (.xlsx o .csv). La exportación de calificaciones de Brightspace sirve tal
+como sale: si trae varios grupos, te preguntamos cuáles importar. Si no tienes la lista, déjalo vacío: la lista se arma sola
+con los estudiantes que marquen, y tú los apruebas.</p>
 """
 
 
-@app.get("/", response_class=HTMLResponse)
-def teacher_screen(request: Request):
-    if not is_teacher(request):
-        return RedirectResponse("/login", status_code=303)
-    return HTMLResponse(TEACHER_PAGE.replace("SECONDS", str(NONCE_SECONDS)))
+@app.get("/course/new", response_class=HTMLResponse)
+def new_course_page(request: Request):
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+    return teacher_page("Nueva clase", f"""
+      <h1>Nueva clase</h1>
+      <div class="card" style="max-width:640px">
+        <form method="post" action="/course/new" enctype="multipart/form-data">
+          <label for="name">Nombre de la clase</label>
+          <input id="name" name="name" required maxlength="100" placeholder="Genética · Grupo 1">
+          <label for="roster_text">Lista de estudiantes</label>
+          {ROSTER_HELP}
+          <textarea id="roster_text" name="roster_text" placeholder="María Fernanda Rojas&#9;2021104567&#10;Juan Sebastián Pérez&#9;2021104568"></textarea>
+          <label for="roster_file">O sube el archivo</label>
+          <input id="roster_file" name="roster_file" type="file" accept=".xlsx,.csv,.txt">
+          <p style="margin-top:18px"><button class="btn big" type="submit">Crear clase</button></p>
+        </form>
+      </div>""", teacher)
 
 
-@app.get("/qr-register-page", response_class=HTMLResponse)
-def registration_qr_page(request: Request):
-    """Screen to project at the start of the first class."""
-    if not is_teacher(request):
-        return RedirectResponse("/login", status_code=303)
-    return wrap("""
-        <h1>Registro UniPresence</h1>
-        <p>Escanea una sola vez. Necesitas el codigo que te entregaron.</p>
-        <p>Esto no marca asistencia.</p>
-        <img src="/qr-register" style="width:380px">
-        <p><a href="/">Volver</a></p>
-    """)
+def _sections(rows):
+    counts = {}
+    for _, _, section in rows:
+        if section:
+            counts[section] = counts.get(section, 0) + 1
+    return dict(sorted(counts.items()))
 
 
-@app.get("/sessions", response_class=HTMLResponse)
-def sessions_page(request: Request):
+def short_section(label: str) -> str:
+    """Brightspace writes 'SISTEMA NERVIOSO2026303614'; people say 'grupo 3614'."""
+    m = re.search(r"(\d{4})\s*$", label or "")
+    return f"Grupo {m.group(1)}" if m else (label or "Sin grupo")
+
+
+def section_picker(teacher, action: str, name: str, rows, problems) -> HTMLResponse:
     """
-    Every session ever held, with its download link.
+    A platform export often holds every group of a subject: the Brightspace
+    file for Fundamentos had 188 students in 9 groups. The professor keeps the
+    groups that are hers, all of them by default; which ones sit in the room
+    on a given day is chosen later, each time attendance starts.
 
-    Without this page the attendance data only existed in the browser tab
-    that started the session. Closing the tab after class made it
-    unreachable, which on the day of a real experiment means losing it.
+    The parsed list travels in a hidden field to the next step. It is the
+    professor's own data going back to the professor, so nothing is gained by
+    storing it in between.
     """
-    if not is_teacher(request):
-        return RedirectResponse("/login", status_code=303)
+    boxes = "".join(
+        f"<label style='font-weight:normal;display:flex;gap:10px;align-items:center'>"
+        f"<input type='checkbox' name='sections' value='{e(sec)}' checked style='width:auto'>"
+        f"<span><strong>{e(short_section(sec))}</strong> <span class='muted'>· {n} estudiantes · {e(sec)}</span></span></label>"
+        for sec, n in _sections(rows).items())
+    warn = (f"<div class='msg warn'>Revisa: {e(' '.join(problems[:5]))}</div>" if problems else "")
+    return HTMLResponse(teacher_page("Elige los grupos", f"""
+      <h1>¿Qué grupos son tuyos?</h1>
+      <p>El archivo trae {len(rows)} estudiantes en {len(_sections(rows))} grupos.
+      Deja marcados los grupos que dictas. Antes de cada clase vas a escoger cuáles
+      están en el salón ese día.</p>{warn}
+      <div class="card" style="max-width:640px">
+        <form method="post" action="{action}">
+          <input type="hidden" name="name" value="{e(name)}">
+          <input type="hidden" name="payload" value="{e(json.dumps(rows))}">
+          <div style="display:grid;gap:8px">{boxes}</div>
+          <p style="margin-top:18px"><button class="btn big" type="submit">Guardar lista</button></p>
+        </form>
+      </div>""", teacher))
 
-    conn = connect()
-    rows = conn.execute("""
-        SELECT s.id, s.course_name, s.started_at, s.ended_at, s.active,
-               (SELECT COUNT(*) FROM attendance a WHERE a.session_id = s.id) AS present
-        FROM sessions s
-        ORDER BY s.id DESC
-    """).fetchall()
-    conn.close()
 
+def _picked(payload: str, sections: list[str]):
+    try:
+        rows = [tuple(r) for r in json.loads(payload)]
+    except (ValueError, TypeError):
+        return []
+    chosen = set(sections)
+    return [r for r in rows if len(r) == 3 and r[2] in chosen]
+
+
+def _create_course(conn, teacher, name, rows):
+    course = conn.execute(
+        "INSERT INTO courses (teacher_id, name) VALUES (%s, %s) RETURNING *",
+        (teacher["id"], name.strip()[:100] or "Clase"),
+    ).fetchone()
+    added = save_roster(conn, course["id"], rows) if rows else 0
+    return course, added
+
+
+@app.post("/course/new")
+async def create_course(request: Request, name: str = Form(...), roster_text: str = Form(""),
+                        roster_file: UploadFile | None = File(None)):
+    rows, problems = await read_roster_input(roster_text, roster_file)
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        if len(_sections(rows)) > 1:
+            return section_picker(teacher, "/course/new/groups", name, rows, problems)
+        course, added = _create_course(conn, teacher, name, rows)
+    note = f"Clase creada con {added} estudiantes." if added else "Clase creada sin lista."
+    if problems:
+        note += " Revisa: " + " ".join(problems[:5])
+    return RedirectResponse(f"/course/{course['id']}?msg={note}", status_code=303)
+
+
+@app.post("/course/new/groups")
+def create_course_groups(request: Request, name: str = Form(...), payload: str = Form(...),
+                         sections: list[str] = Form(default=[])):
+    rows = _picked(payload, sections)
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        course, added = _create_course(conn, teacher, name, rows)
+    note = (f"Clase creada con {added} estudiantes de {len(sections)} grupo(s)." if added
+            else "Clase creada sin lista: no marcaste ningún grupo.")
+    return RedirectResponse(f"/course/{course['id']}?msg={note}", status_code=303)
+
+
+@app.get("/course/{course_id}", response_class=HTMLResponse)
+def course_page(course_id: int, request: Request, msg: str = ""):
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        course = own_course(conn, teacher, course_id)
+        students = conn.execute("""
+            SELECT st.id, st.carne, st.name, st.device_id IS NOT NULL AS linked, en.status,
+                   en.section
+            FROM enrollments en JOIN students st ON st.id = en.student_id
+            WHERE en.course_id = %s ORDER BY en.status DESC, en.section, st.name
+        """, (course_id,)).fetchall()
+        sessions = conn.execute("""
+            SELECT s.*, (SELECT COUNT(*) FROM attendance a WHERE a.session_id = s.id) AS present
+            FROM sessions s WHERE s.course_id = %s ORDER BY s.id DESC
+        """, (course_id,)).fetchall()
+
+    pending = [s for s in students if s["status"] == "pendiente"]
+    pending_html = ""
+    if pending:
+        rows = "".join(
+            f"<tr><td>{e(s['name'])}</td><td>{e(s['carne'])}</td><td>"
+            f"<form class='inline' method='post' action='/course/{course_id}/approve'>"
+            f"<input type='hidden' name='student_id' value='{s['id']}'>"
+            f"<button class='btn small' type='submit'>Aprobar</button></form> "
+            f"<form class='inline' method='post' action='/course/{course_id}/remove'>"
+            f"<input type='hidden' name='student_id' value='{s['id']}'>"
+            f"<button class='btn small grey' type='submit'>Quitar</button></form></td></tr>"
+            for s in pending)
+        pending_html = f"""
+          <h2>Por aprobar ({len(pending)})</h2>
+          <p class="hint">Se unieron marcando asistencia. Aprueba a los que reconoces como tus estudiantes.</p>
+          <form method="post" action="/course/{course_id}/approve">
+            <input type="hidden" name="all" value="1">
+            <button class="btn light small" type="submit">Aprobar a todos</button></form>
+          <div class="table-wrap" style="margin-top:10px"><table>
+            <tr><th>Nombre</th><th>Carné</th><th></th></tr>{rows}</table></div>"""
+
+    approved = [s for s in students if s["status"] == "aprobado"]
+    linked_yes = "<span class='pill ok'>sí</span>"
+    linked_no = "<span class='muted'>todavía no</span>"
+    roster_rows = "".join(
+        f"<tr><td>{e(s['name'])}</td><td>{e(s['carne'])}</td>"
+        f"<td>{e(short_section(s['section'])) if s['section'] else ''}</td>"
+        f"<td>{linked_yes if s['linked'] else linked_no}</td></tr>"
+        for s in approved)
+
+    live_pill = "<span class='pill ok'>en curso</span>"
+    session_rows = ""
+    for s in sessions:
+        ended = live_pill if s["active"] else local(s["ended_at"])
+        links = f"<a href='/session/{s['id']}/report'>Reporte</a>"
+        if s["active"]:
+            links = f"<a href='/session/{s['id']}/live'>Pantalla en vivo</a> · " + links
+        session_rows += (f"<tr><td>#{s['id']}</td><td>{local(s['started_at'])}</td>"
+                         f"<td>{ended}</td><td>{s['present']}</td><td>{links}</td></tr>")
+
+    flash = f"<div class='msg ok'>{e(msg)}</div>" if msg else ""
+    return teacher_page(course["name"], f"""
+      <h1>{e(course['name'])}</h1>{flash}
+      <form method="post" action="/course/{course_id}/start" style="max-width:420px">
+        <button class="btn big" type="submit">Tomar asistencia</button></form>
+      {pending_html}
+      <h2>Lista ({len(approved)})</h2>
+      <div class="table-wrap"><table>
+        <tr><th>Nombre</th><th>Carné</th><th>Grupo</th><th>Celular vinculado</th></tr>
+        {roster_rows or "<tr><td colspan=4 class=muted>Sin estudiantes todavía.</td></tr>"}
+      </table></div>
+      <details style="margin-top:12px"><summary>Agregar o actualizar la lista</summary>
+        <div class="card" style="margin-top:10px">
+          <form method="post" action="/course/{course_id}/roster" enctype="multipart/form-data">
+            {ROSTER_HELP}
+            <textarea name="roster_text" aria-label="Lista pegada"></textarea>
+            <label for="rf">O sube el archivo</label>
+            <input id="rf" name="roster_file" type="file" accept=".xlsx,.csv,.txt">
+            <p style="margin-top:14px"><button class="btn" type="submit">Guardar lista</button></p>
+          </form>
+        </div>
+      </details>
+      <h2>Historial</h2>
+      <div class="table-wrap"><table>
+        <tr><th>Sesión</th><th>Inicio</th><th>Fin</th><th>Presentes</th><th></th></tr>
+        {session_rows or "<tr><td colspan=5 class=muted>Todavía no hay sesiones.</td></tr>"}
+      </table></div>""", teacher)
+
+
+@app.post("/course/{course_id}/roster")
+async def update_roster(course_id: int, request: Request, roster_text: str = Form(""),
+                        roster_file: UploadFile | None = File(None)):
+    rows, problems = await read_roster_input(roster_text, roster_file)
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        course = own_course(conn, teacher, course_id)
+        if len(_sections(rows)) > 1:
+            return section_picker(teacher, f"/course/{course_id}/roster/groups",
+                                  course["name"], rows, problems)
+        added = save_roster(conn, course_id, rows) if rows else 0
+    note = f"Lista guardada: {added} estudiantes." if rows else "No encontré estudiantes en lo que enviaste."
+    if problems:
+        note += " Revisa: " + " ".join(problems[:5])
+    return RedirectResponse(f"/course/{course_id}?msg={note}", status_code=303)
+
+
+@app.post("/course/{course_id}/roster/groups")
+def update_roster_groups(course_id: int, request: Request, payload: str = Form(...),
+                         sections: list[str] = Form(default=[]), name: str = Form("")):
+    rows = _picked(payload, sections)
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        own_course(conn, teacher, course_id)
+        added = save_roster(conn, course_id, rows) if rows else 0
+    note = f"Lista guardada: {added} estudiantes." if added else "No marcaste ningún grupo."
+    return RedirectResponse(f"/course/{course_id}?msg={note}", status_code=303)
+
+
+@app.post("/course/{course_id}/approve")
+def approve(course_id: int, request: Request, student_id: int = Form(0), all: str = Form("")):
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        own_course(conn, teacher, course_id)
+        if all:
+            conn.execute("UPDATE enrollments SET status = 'aprobado' WHERE course_id = %s",
+                         (course_id,))
+        else:
+            conn.execute("UPDATE enrollments SET status = 'aprobado' "
+                         "WHERE course_id = %s AND student_id = %s", (course_id, student_id))
+    return RedirectResponse(f"/course/{course_id}", status_code=303)
+
+
+@app.post("/course/{course_id}/remove")
+def remove(course_id: int, request: Request, student_id: int = Form(...)):
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        own_course(conn, teacher, course_id)
+        conn.execute("DELETE FROM enrollments WHERE course_id = %s AND student_id = %s",
+                     (course_id, student_id))
+    return RedirectResponse(f"/course/{course_id}", status_code=303)
+
+
+# ---------------------------------------------------------------
+# READING A CLASS LIST
+#
+# Same idea as generate_codes.py: accept whatever the professor has. A paste
+# from Excel arrives separated by tabs; a CSV exported from Excel in Spanish
+# uses semicolons.
+# ---------------------------------------------------------------
+
+def _plain(text: str) -> str:
+    text = unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore").decode()
+    return text.strip().lower()
+
+
+# Column names seen in the wild. Brightspace (Uninorte's platform) exports
+# "OrgDefinedId, Last Name, First Name, Email, Sections"; Spanish sheets use
+# "Código, Apellidos, Nombres"; a paste from anywhere may have no header at all.
+FULL_NAME_HEADERS = {"name", "full name", "estudiante", "alumno", "nombre completo",
+                     "apellidos y nombres", "nombres y apellidos"}
+FIRST_NAME_HEADERS = {"first name", "nombre", "nombres", "primer nombre"}
+LAST_NAME_HEADERS = {"last name", "apellido", "apellidos"}
+CARNE_HEADERS = {"carne", "carnet", "codigo", "codigo estudiantil", "codigo de estudiante",
+                 "id", "student id", "id estudiante", "orgdefinedid", "org defined id",
+                 "documento", "matricula", "cedula", "username", "usuario"}
+SECTION_HEADERS = {"sections", "section", "seccion", "secciones", "grupo", "nrc"}
+# Email is read past on purpose: the system has no use for it, and data it
+# does not keep cannot leak.
+
+
+def _looks_like_carne(cell: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9\-]*\d{4,}[A-Za-z0-9\-]*", cell))
+
+
+def _tidy_name(name: str) -> str:
+    """Platforms export names in capitals; the report reads better in title case."""
+    name = re.sub(r"\s+", " ", name).strip()
+    if name and name == name.upper():
+        name = name.title()
+    return name[:80]
+
+
+def parse_roster_rows(rows):
+    """
+    Returns ([(carne, name, section), ...], [problems]).
+
+    With headers, the columns are found by name; first and last name in
+    separate columns are joined. Without headers, the cell that looks like an
+    ID (four or more digits, no spaces) is the carne and the rest is the name.
+    `section` is the group the row belongs to, or "" when the file has none.
+    """
+    rows = [[normalize_cell(c) for c in r] for r in rows if any(normalize_cell(c) for c in r)]
     if not rows:
-        return wrap("<h2>Clases anteriores</h2><p>Todavia no hay ninguna.</p>"
-                    "<p><a href='/'>Volver</a></p>")
+        return [], []
+    header = [_plain(c) for c in rows[0]]
 
-    body = ["<h2>Clases anteriores</h2><table>",
-            "<tr><th>Clase</th><th>Inicio</th><th>Fin</th>"
-            "<th>Presentes</th><th></th></tr>"]
-    for r in rows:
-        state = "en curso" if r["active"] else to_local(r["ended_at"])
-        body.append(
-            f"<tr><td>{r['course_name']} #{r['id']}</td>"
-            f"<td>{to_local(r['started_at'])}</td>"
-            f"<td>{state}</td>"
-            f"<td>{r['present']}</td>"
-            f"<td><a href='/session/{r['id']}/csv'>Descargar CSV</a></td></tr>"
+    def col(names):
+        return next((i for i, h in enumerate(header) if h in names), None)
+
+    full_col, first_col, last_col = col(FULL_NAME_HEADERS), col(FIRST_NAME_HEADERS), col(LAST_NAME_HEADERS)
+    carne_col, section_col = col(CARNE_HEADERS), col(SECTION_HEADERS)
+
+    result, problems, seen = [], [], set()
+
+    def cell(r, i):
+        return r[i] if i is not None and i < len(r) else ""
+
+    def add(carne, name, section, line):
+        carne = normalize_carne(carne)
+        name = _tidy_name(name)
+        if not carne:
+            problems.append(f"fila {line}: sin carné.")
+            return
+        if not name:
+            problems.append(f"fila {line}: sin nombre.")
+            return
+        if carne in seen:
+            problems.append(f"fila {line}: carné {carne} repetido.")
+            return
+        seen.add(carne)
+        result.append((carne, name, section.strip()))
+
+    has_name = full_col is not None or first_col is not None or last_col is not None
+    if has_name or carne_col is not None:
+        if not has_name or carne_col is None:
+            missing = "nombre" if not has_name else "carné o código"
+            return [], [f"La lista tiene encabezados pero falta la columna de {missing}."]
+        for n, r in enumerate(rows[1:], start=2):
+            if full_col is not None:
+                name = cell(r, full_col)
+            else:
+                name = f"{cell(r, first_col)} {cell(r, last_col)}"
+            add(cell(r, carne_col), name, cell(r, section_col), n)
+        return result, problems
+
+    for n, r in enumerate(rows, start=1):
+        cells = [c for c in r if c]
+        carne = next((c for c in cells if _looks_like_carne(c)), "")
+        name = " ".join(c for c in cells if c != carne and "@" not in c)
+        add(carne, name, "", n)
+    return result, problems
+
+
+def normalize_cell(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return str(value).strip()
+
+
+async def read_roster_input(text: str, upload: UploadFile | None):
+    if upload is not None and upload.filename:
+        data = await upload.read()
+        if upload.filename.lower().endswith(".xlsx"):
+            try:
+                import openpyxl
+                wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+                rows = [list(r) for r in wb.worksheets[0].iter_rows(values_only=True)]
+                return parse_roster_rows(rows)
+            except Exception:
+                return [], ["No pude leer ese archivo de Excel."]
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = data.decode("latin-1")
+    text = (text or "").strip()
+    if not text:
+        return [], []
+    if "\t" in text:
+        delimiter = "\t"
+    else:
+        try:
+            delimiter = csv.Sniffer().sniff(text[:4096], delimiters=",;").delimiter
+        except csv.Error:
+            delimiter = ","
+    return parse_roster_rows(list(csv.reader(io.StringIO(text), delimiter=delimiter)))
+
+
+def save_roster(conn, course_id, rows) -> int:
+    """
+    The list from the university is authoritative: if a student typed their
+    own name differently when checking in, the list's spelling wins, and
+    anyone on the list who was waiting for approval becomes approved.
+    """
+    for carne, name, *rest in rows:
+        section = rest[0] if rest else ""
+        student = conn.execute(
+            "INSERT INTO students (carne, name) VALUES (%s, %s) "
+            "ON CONFLICT (carne) DO UPDATE SET name = EXCLUDED.name RETURNING id",
+            (carne, name),
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO enrollments (course_id, student_id, status, section) "
+            "VALUES (%s, %s, 'aprobado', %s) "
+            "ON CONFLICT (course_id, student_id) DO UPDATE SET status = 'aprobado', "
+            "section = EXCLUDED.section",
+            (course_id, student["id"], section),
         )
-    body.append("</table><p><a href='/'>Volver</a></p>")
-    return wrap("".join(body))
+    conn.execute("UPDATE courses SET has_roster = TRUE WHERE id = %s", (course_id,))
+    return len(rows)
 
 
 # ---------------------------------------------------------------
-# SESSIONS  (teacher only)
+# SESSIONS AND THE LIVE SCREEN
 # ---------------------------------------------------------------
 
-@app.post("/session/start")
-def start_session(request: Request, course_name: str = "Genetica"):
-    if not is_teacher(request):
-        return Response(status_code=401)
+def course_sections(conn, course_id):
+    """Groups in a class with their sizes, e.g. {'SISTEMA NERVIOSO2026303614': 26}."""
+    return {r["section"]: r["n"] for r in conn.execute(
+        "SELECT section, COUNT(*) AS n FROM enrollments "
+        "WHERE course_id = %s AND section <> '' GROUP BY section ORDER BY section",
+        (course_id,)).fetchall()}
 
-    conn = connect()
 
-    # Close anything left open. If a previous class was never ended, every
-    # later registration would be labelled as happening in the classroom.
-    conn.execute(
-        "UPDATE sessions SET active = 0, ended_at = ? WHERE active = 1",
-        (now(),),
-    )
+@app.post("/course/{course_id}/start")
+def start_session(course_id: int, request: Request, sections: list[str] = Form(default=[]),
+                  chosen: str = Form("")):
+    """
+    One class, several groups: a professor may teach groups 3614-3616 at 7:00
+    and 3617-3619 at 9:00 from the same list. When the class has more than one
+    group, she picks today's groups first, and the absent list counts only
+    those. The choice is saved with the session, so the report knows it too.
+    """
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        course = own_course(conn, teacher, course_id)
+        groups = course_sections(conn, course_id)
+        if len(groups) > 1 and not chosen:
+            boxes = "".join(
+                f"<label style='font-weight:normal;display:flex;gap:10px;align-items:center;"
+                f"padding:10px;border:1px solid var(--line);border-radius:8px;background:#fff'>"
+                f"<input type='checkbox' name='sections' value='{e(sec)}' style='width:auto'>"
+                f"<span><strong>{e(short_section(sec))}</strong> "
+                f"<span class='muted'>· {n} estudiantes</span></span></label>"
+                for sec, n in groups.items())
+            return HTMLResponse(teacher_page("Grupos de hoy", f"""
+              <h1>{e(course['name'])}</h1>
+              <p style="font-size:18px">¿Qué grupos están en el salón ahora?</p>
+              <form method="post" action="/course/{course_id}/start" style="max-width:520px">
+                <input type="hidden" name="chosen" value="1">
+                <div style="display:grid;gap:8px">{boxes}</div>
+                <p class="hint">Si no marcas ninguno, se cuentan todos los grupos.</p>
+                <p style="margin-top:14px"><button class="btn big" type="submit">Tomar asistencia</button></p>
+              </form>""", teacher))
+        picked = [sec for sec in sections if sec in groups] or None
+        # A professor teaches one class at a time. Anything left open from an
+        # earlier class is closed, so it cannot keep accepting check-ins.
+        conn.execute("""
+            UPDATE sessions SET active = FALSE, ended_at = now()
+            WHERE active AND course_id IN (SELECT id FROM courses WHERE teacher_id = %s)
+        """, (teacher["id"],))
+        session = conn.execute(
+            "INSERT INTO sessions (course_id, sections) VALUES (%s, %s) RETURNING id",
+            (course_id, picked)).fetchone()
+        conn.execute("UPDATE courses SET last_used_at = now() WHERE id = %s", (course_id,))
+    return RedirectResponse(f"/session/{session['id']}/live", status_code=303)
 
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO sessions (course_name, started_at, active) VALUES (?, ?, 1)",
-        (course_name, now()),
-    )
-    conn.commit()
-    session_id = c.lastrowid
-    conn.close()
-    return {"session_id": session_id, "course_name": course_name}
+
+LIVE_PAGE = """
+<style>
+  .live-grid { display:grid; grid-template-columns:minmax(0,1.1fr) minmax(0,1fr); gap:20px; align-items:start; }
+  @media (max-width:820px) { .live-grid { grid-template-columns:1fr; } }
+  #qr { width:100%; max-width:440px; aspect-ratio:1; display:block; margin:0 auto;
+        background:#fff; border:1px solid var(--line); border-radius:10px; }
+  #count { font-size:64px; font-weight:800; line-height:1; font-variant-numeric:tabular-nums; }
+  .list { display:grid; gap:6px; margin-top:8px; max-height:260px; overflow:auto; }
+  .absent-btn { text-align:left; background:#fff; border:1px solid var(--line); border-radius:8px;
+                padding:8px 10px; font:inherit; cursor:pointer; }
+  .absent-btn:hover { border-color:var(--ok); }
+  .alert { background:var(--warn-soft); border-radius:8px; padding:8px 10px; font-size:14px; }
+  .recent { font-size:14px; }
+</style>
+<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+  <h1>__COURSE__</h1>
+  <form method="post" action="/session/__SID__/end"
+        onsubmit="return confirm('¿Terminar la asistencia de esta clase?')">
+    <button class="btn red" type="submit">Terminar asistencia</button></form>
+</div>
+<div class="live-grid">
+  <div class="card" style="text-align:center">
+    <p style="margin:0 0 8px;font-size:20px;font-weight:700">Escanea con la cámara para marcar asistencia</p>
+    <img id="qr" alt="Código QR de asistencia">
+    <p class="hint">Cambia cada __ROT__ segundos. No hace falta instalar nada.</p>
+  </div>
+  <div style="display:grid;gap:14px">
+    <div class="card">
+      <div class="muted">Presentes</div>
+      <div id="count">0</div>
+      <div id="pending" class="hint"></div>
+    </div>
+    <div class="card">
+      <strong>Por revisar</strong>
+      <div id="alerts" class="list"><span class="muted">Nada por ahora.</span></div>
+    </div>
+    <div class="card">
+      <strong>Ausentes</strong> <span class="hint">· toca un nombre para marcarlo a mano</span>
+      <div id="absent" class="list"></div>
+      <details style="margin-top:10px"><summary>Agregar a alguien que no está en la lista</summary>
+        <form id="addForm" style="margin-top:8px">
+          <input id="addCarne" placeholder="Carné" required>
+          <input id="addName" placeholder="Nombre" style="margin-top:6px">
+          <button class="btn small" type="submit" style="margin-top:6px">Agregar y marcar</button>
+        </form>
+      </details>
+      <p id="manualMsg" class="hint"></p>
+    </div>
+    <div class="card recent"><strong>Últimos en marcar</strong><div id="recent" class="list"></div></div>
+  </div>
+</div>
+<script>
+const SID = __SID__, ROT = __ROT__;
+function refreshQR() { document.getElementById('qr').src = '/session/' + SID + '/qr?t=' + Date.now(); }
+refreshQR(); setInterval(refreshQR, ROT * 1000);
+
+function el(tag, text, cls) { const n = document.createElement(tag); n.textContent = text; if (cls) n.className = cls; return n; }
+
+async function poll() {
+  const r = await fetch('/session/' + SID + '/state');
+  if (r.status === 401) { location = '/login'; return; }
+  if (!r.ok) return;
+  const d = await r.json();
+  if (!d.active) { location = '/session/' + SID + '/report'; return; }
+  document.getElementById('count').textContent = d.present + ' de ' + d.total;
+  document.getElementById('pending').textContent =
+    d.pending ? d.pending + ' estudiante(s) nuevos por aprobar al final' : '';
+
+  const alerts = document.getElementById('alerts'); alerts.innerHTML = '';
+  if (!d.alerts.length) alerts.appendChild(el('span', 'Nada por ahora.', 'muted'));
+  d.alerts.forEach(a => alerts.appendChild(el('div', a.time + ' · ' + (a.name ? a.name + ' · ' : '') + a.label + (a.detail ? ' (' + a.detail + ')' : ''), 'alert')));
+
+  const absent = document.getElementById('absent'); absent.innerHTML = '';
+  if (!d.absent.length) absent.appendChild(el('span', d.total ? 'Nadie. Están todos.' : 'Sin lista: aparecerán al marcar.', 'muted'));
+  d.absent.forEach(s => {
+    const b = el('button', s.name + ' · ' + s.carne, 'absent-btn');
+    b.type = 'button';
+    b.onclick = () => manual({ student_id: s.id }, s.name);
+    absent.appendChild(b);
+  });
+
+  const recent = document.getElementById('recent'); recent.innerHTML = '';
+  d.recent.forEach(s => recent.appendChild(el('div', s.time + ' · ' + s.name + (s.method === 'manual' ? ' (a mano)' : ''))));
+}
+
+async function manual(fields, label) {
+  const f = new FormData();
+  Object.entries(fields).forEach(([k, v]) => f.append(k, v));
+  const r = await fetch('/session/' + SID + '/manual', { method: 'POST', body: f });
+  const d = await r.json().catch(() => ({ message: 'No se pudo marcar.' }));
+  document.getElementById('manualMsg').textContent = d.message;
+  poll();
+}
+
+document.getElementById('addForm').addEventListener('submit', ev => {
+  ev.preventDefault();
+  manual({ carne: document.getElementById('addCarne').value, name: document.getElementById('addName').value });
+  ev.target.reset();
+});
+
+poll(); setInterval(poll, 3000);
+</script>
+"""
+
+
+@app.get("/session/{session_id}/live", response_class=HTMLResponse)
+def live_page(session_id: int, request: Request):
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        session = own_session(conn, teacher, session_id)
+    if not session["active"]:
+        return RedirectResponse(f"/session/{session_id}/report", status_code=303)
+    title = session["course_name"]
+    if session["sections"]:
+        title += " · " + ", ".join(short_section(g) for g in session["sections"])
+    body = (LIVE_PAGE.replace("__SID__", str(session_id))
+            .replace("__ROT__", str(QR_ROTATE_SECONDS))
+            .replace("__COURSE__", e(title)))
+    return teacher_page(session["course_name"], body, teacher)
+
+
+@app.get("/session/{session_id}/state")
+def live_state(session_id: int, request: Request):
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        session = own_session(conn, teacher, session_id)
+        # Only the groups chosen for this session count toward "X de Y".
+        groups = session["sections"]
+        total = conn.execute(
+            "SELECT COUNT(*) AS n FROM enrollments WHERE course_id = %s "
+            "AND (%s::text[] IS NULL OR section = ANY(%s::text[]))",
+            (session["course_id"], groups, groups)).fetchone()["n"]
+        pending = conn.execute("SELECT COUNT(*) AS n FROM enrollments WHERE course_id = %s "
+                               "AND status = 'pendiente'", (session["course_id"],)).fetchone()["n"]
+        present = conn.execute("SELECT COUNT(*) AS n FROM attendance WHERE session_id = %s",
+                               (session_id,)).fetchone()["n"]
+        absent = conn.execute("""
+            SELECT st.id, st.name, st.carne FROM enrollments en
+            JOIN students st ON st.id = en.student_id
+            WHERE en.course_id = %s
+              AND (%s::text[] IS NULL OR en.section = ANY(%s::text[]))
+              AND NOT EXISTS (
+                SELECT 1 FROM attendance a WHERE a.session_id = %s AND a.student_id = st.id)
+            ORDER BY st.name
+        """, (session["course_id"], groups, groups, session_id)).fetchall()
+        recent = conn.execute("""
+            SELECT st.name, a.marked_at, a.method FROM attendance a
+            JOIN students st ON st.id = a.student_id
+            WHERE a.session_id = %s ORDER BY a.marked_at DESC LIMIT 8
+        """, (session_id,)).fetchall()
+        alerts = conn.execute("""
+            SELECT ev.*, st.name FROM events ev LEFT JOIN students st ON st.id = ev.student_id
+            WHERE ev.session_id = %s AND ev.review ORDER BY ev.created_at DESC LIMIT 30
+        """, (session_id,)).fetchall()
+    return {
+        "active": session["active"],
+        "present": present, "total": total, "pending": pending,
+        "absent": [{"id": a["id"], "name": a["name"], "carne": a["carne"]} for a in absent],
+        "recent": [{"name": r["name"], "time": local_time(r["marked_at"]), "method": r["method"]}
+                   for r in recent],
+        "alerts": [{"time": local_time(a["created_at"]), "name": a["name"] or "",
+                    "label": EVENT_LABELS.get(a["kind"], a["kind"]), "detail": a["detail"]}
+                   for a in alerts],
+    }
+
+
+@app.post("/session/{session_id}/manual")
+def manual_mark(session_id: int, request: Request, student_id: int = Form(0),
+                carne: str = Form(""), name: str = Form("")):
+    """
+    For the dead battery, the phone with no data, or the student not on the
+    list. Recorded as manual and as an event, so the report says who was
+    marked by hand.
+    """
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        session = own_session(conn, teacher, session_id)
+        if not session["active"]:
+            return {"message": "Esta asistencia ya terminó."}
+        if student_id:
+            student = conn.execute(
+                "SELECT st.* FROM students st JOIN enrollments en ON en.student_id = st.id "
+                "WHERE st.id = %s AND en.course_id = %s", (student_id, session["course_id"]),
+            ).fetchone()
+            if not student:
+                return {"message": "Ese estudiante no está en esta clase."}
+        else:
+            carne = normalize_carne(carne)
+            if not carne:
+                return {"message": "Escribe el carné."}
+            student = conn.execute("SELECT * FROM students WHERE carne = %s", (carne,)).fetchone()
+            if not student:
+                if not name.strip():
+                    return {"message": "Ese carné es nuevo: escribe también el nombre."}
+                student = conn.execute(
+                    "INSERT INTO students (carne, name) VALUES (%s, %s) RETURNING *",
+                    (carne, name.strip()[:80]),
+                ).fetchone()
+            conn.execute(
+                "INSERT INTO enrollments (course_id, student_id, status) VALUES (%s, %s, 'aprobado') "
+                "ON CONFLICT (course_id, student_id) DO UPDATE SET status = 'aprobado'",
+                (session["course_id"], student["id"]),
+            )
+        _, created = record_attendance(conn, session, student, "manual")
+        if created:
+            log_event(conn, session_id, student["id"], "manual", f"por {teacher['name']}")
+    return {"message": f"{student['name']}: {'marcado a mano' if created else 'ya estaba marcado'}."}
 
 
 @app.post("/session/{session_id}/end")
 def end_session(session_id: int, request: Request):
-    if not is_teacher(request):
-        return Response(status_code=401)
-
-    conn = connect()
-    conn.execute(
-        "UPDATE sessions SET active = 0, ended_at = ? WHERE id = ? AND active = 1",
-        (now(), session_id),
-    )
-    conn.commit()
-
-    present = conn.execute(
-        "SELECT COUNT(*) AS n FROM attendance WHERE session_id = ?", (session_id,)
-    ).fetchone()["n"]
-    total = conn.execute("SELECT COUNT(*) AS n FROM students").fetchone()["n"]
-    changes = conn.execute(
-        "SELECT COUNT(*) AS n FROM device_changes WHERE session_id = ?", (session_id,)
-    ).fetchone()["n"]
-    conn.close()
-    return {"count": present, "total": total, "changes": changes}
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        own_session(conn, teacher, session_id)
+        conn.execute("UPDATE sessions SET active = FALSE, ended_at = now() "
+                     "WHERE id = %s AND active", (session_id,))
+        # Nonces and tickets are worthless once the class is closed.
+        conn.execute("DELETE FROM nonces WHERE session_id = %s", (session_id,))
+        conn.execute("DELETE FROM scan_tickets WHERE session_id = %s", (session_id,))
+    return RedirectResponse(f"/session/{session_id}/report", status_code=303)
 
 
-@app.get("/session/{session_id}/count")
-def session_count(session_id: int, request: Request):
-    if not is_teacher(request):
-        return Response(status_code=401)
-
-    conn = connect()
-    present = conn.execute(
-        "SELECT COUNT(*) AS n FROM attendance WHERE session_id = ?", (session_id,)
-    ).fetchone()["n"]
-    total = conn.execute("SELECT COUNT(*) AS n FROM students").fetchone()["n"]
-    # Device changes during THIS class. A couple are normal, a student who
-    # changed phones. A sudden run of them during an exam is worth a look.
-    changes = conn.execute(
-        "SELECT COUNT(*) AS n FROM device_changes WHERE session_id = ?", (session_id,)
-    ).fetchone()["n"]
-    conn.close()
-    return {"count": present, "total": total, "changes": changes}
+def base_url(request: Request) -> str:
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host", request.headers.get("host", ""))
+    return f"{proto}://{host}"
 
 
-@app.get("/session/{session_id}/csv")
-def export_csv(session_id: int, request: Request):
+@app.get("/session/{session_id}/qr")
+def attendance_qr(session_id: int, request: Request):
     """
-    Download the attendance list. The first thing a professor wants to see.
-
-    The column headers stay in Spanish: this file is opened by the professor,
-    not by a developer.
+    Mint a nonce and return the attendance QR. TEACHER ONLY: in version 1 this
+    endpoint was public for a while, and a registered student could fetch a
+    valid code from home. The QR must only exist where the professor projects it.
     """
-    if not is_teacher(request):
-        return Response(status_code=401)
-
-    conn = connect()
-    rows = conn.execute("""
-        SELECT s.student_code, s.name, a.timestamp, a.method, s.registered_where,
-               (SELECT COUNT(*) FROM device_changes d
-                 WHERE d.student_id = s.id AND d.session_id = a.session_id) AS moved
-        FROM attendance a
-        JOIN students s ON s.id = a.student_id
-        WHERE a.session_id = ?
-        ORDER BY s.name
-    """, (session_id,)).fetchall()
-    conn.close()
-
-    lines = ["codigo,nombre,hora,metodo,donde_se_registro,cambio_de_dispositivo"]
-    for r in rows:
-        lines.append(
-            f"{r['student_code']},{r['name']},{to_local(r['timestamp'])},"
-            f"{r['method']},{r['registered_where'] or ''},"
-            f"{'si' if r['moved'] else 'no'}"
-        )
-    text = "\n".join(lines)
-
-    return StreamingResponse(
-        io.BytesIO(text.encode("utf-8")),
-        media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=asistencia_{session_id}.csv"},
-    )
-
-
-# ---------------------------------------------------------------
-# QR CODES
-# ---------------------------------------------------------------
-
-def qr_png(url: str) -> StreamingResponse:
-    img = qrcode.make(url)
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        session = own_session(conn, teacher, session_id)
+        if not session["active"]:
+            return Response(status_code=410)
+        nonce = secrets.token_hex(8)
+        conn.execute("INSERT INTO nonces (nonce, session_id, expires_at) VALUES (%s, %s, %s)",
+                     (nonce, session_id, utcnow() + timedelta(seconds=NONCE_VALID_SECONDS)))
+    img = qrcode.make(f"{base_url(request)}/checkin?s={session_id}&n={nonce}")
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
     buffer.seek(0)
@@ -708,412 +1596,423 @@ def qr_png(url: str) -> StreamingResponse:
                              headers={"Cache-Control": "no-store"})
 
 
-@app.get("/qr/{session_id}")
-def attendance_qr(session_id: int, request: Request):
-    """
-    Mint a new nonce and return the attendance QR as a PNG.
-
-    TEACHER ONLY, and this is the important part. This endpoint hands out a
-    currently valid nonce. While it was public, a registered student could
-    request it from anywhere and check in without being in the room, which
-    defeats the entire point of the system. Session ids are small integers
-    and easy to guess, so obscurity was no protection at all.
-
-    Behind the gate, the QR only exists where the teacher projects it.
-
-    Note on design: the QR carries a full URL rather than a bare code, so the
-    phone's built-in camera opens it directly. No QR reader to write, no
-    camera permission to request, and it works the same on iOS and Android.
-    """
-    if not is_teacher(request):
-        return Response(status_code=401)
-
-    nonce = secrets.token_hex(8)
-    created = datetime.now(timezone.utc)
-    expires = created + timedelta(seconds=NONCE_SECONDS)
-
-    conn = connect()
-    conn.execute(
-        "INSERT INTO nonces (nonce, session_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
-        (nonce, session_id, created.isoformat(), expires.isoformat()),
-    )
-    conn.commit()
-    conn.close()
-
-    base = str(request.base_url).rstrip("/")
-    return qr_png(f"{base}/checkin?s={session_id}&n={nonce}")
-
-
-@app.get("/qr-register")
-def registration_qr(request: Request):
-    """
-    Fixed registration QR. It does not rotate, expire or carry a nonce.
-
-    Leaving this one public is safe: it encodes nothing but the address of
-    the registration page. Without an assigned code, that page grants
-    nothing.
-    """
-    base = str(request.base_url).rstrip("/")
-    return qr_png(f"{base}/register")
-
-
 # ---------------------------------------------------------------
-# REGISTRATION, IN TWO STEPS  (open to students)
-#   step 1: type the assigned code
-#   step 2: confirm the name is right
-#
-# Order matters: asking for the code FIRST avoids publishing the whole
-# course roster on a page open to the internet.
+# CHECK-IN  (open to students: one QR, one tap)
 # ---------------------------------------------------------------
 
-CODE_FORM = """
-    <h2>Registro</h2>
-    <p>Escribe el codigo que te entregaron. Se hace una sola vez
-    y no marca asistencia.</p>
-    <p style="color:#666;font-size:15px">Hazlo en el mismo navegador con el
-    que vas a escanear el QR en clase. Si abriste este enlace dentro de
-    WhatsApp o Instagram, mejor cierra y escanea el QR con la camara.</p>
-    <form method="post" action="/register">
-      <input name="student_code" placeholder="Codigo" required autofocus autocapitalize="characters">
-      <button type="submit">Continuar</button>
-    </form>
-"""
+def session_for_student(conn, session_id):
+    return conn.execute("""
+        SELECT s.*, c.name AS course_name, c.has_roster, t.name AS teacher_name
+        FROM sessions s JOIN courses c ON c.id = s.course_id
+        JOIN teachers t ON t.id = c.teacher_id WHERE s.id = %s
+    """, (session_id,)).fetchone()
 
 
-@app.get("/register", response_class=HTMLResponse)
-def registration_page(request: Request):
-    device_id = request.cookies.get("device_id")
-
-    if device_id:
-        conn = connect()
-        student = conn.execute(
-            "SELECT * FROM students WHERE device_id = ?", (device_id,)
-        ).fetchone()
-        conn.close()
-        if student:
-            return wrap(
-                f"<p class='ok'>Ya estas registrado</p>"
-                f"<div class='name'>{student['name']}</div>"
-                f"<p>En clase solo escanea el QR de asistencia.</p>"
-            )
-
-    response = HTMLResponse(wrap(CODE_FORM))
-    if not device_id:
-        new_id = secrets.token_hex(16)
-        response.set_cookie("device_id", new_id, max_age=31536000,
-                            httponly=True, samesite="lax")
-    return response
+def class_over_page():
+    return student_page("<p class='bad-title'>Esta clase ya terminó</p>"
+                        "<p>Si viniste a clase, avísale al profesor para que te marque a mano.</p>")
 
 
-@app.post("/register", response_class=HTMLResponse)
-def step1_check_code(request: Request, student_code: str = Form(...)):
-    """Step 1: does the code exist and is it unclaimed? If so, show the name."""
-    device_id = request.cookies.get("device_id")
-    if not device_id:
-        return wrap("<p class='error'>No se pudo identificar el dispositivo. "
-                    "Recarga la pagina e intenta de nuevo.</p>")
-
-    code = student_code.strip().upper()
-
-    conn = connect()
-    student = conn.execute(
-        "SELECT * FROM students WHERE UPPER(student_code) = ?", (code,)
-    ).fetchone()
-
-    # This phone already belongs to someone else.
-    already = conn.execute(
-        "SELECT * FROM students WHERE device_id = ?", (device_id,)
-    ).fetchone()
-    conn.close()
-
-    if already:
-        return wrap(
-            f"<p class='error'>Este telefono ya esta registrado</p>"
-            f"<div class='name'>{already['name']}</div>"
-            f"<p>Un telefono solo puede pertenecer a un estudiante.</p>"
-        )
-
-    if student is None:
-        return wrap(
-            "<p class='error'>Ese codigo no existe</p>"
-            "<p>Revisa que este bien escrito. Si sigue sin funcionar, "
-            "avisale a la profesora.</p>"
-            + CODE_FORM
-        )
-
-    if student["device_id"]:
-        # The pilot answered this case with "Ese codigo ya fue usado. Si tu
-        # no lo registraste, avisale a la profesora de inmediato", which told
-        # 7 students they were thieves of their own code. The common cause is
-        # far more boring: they registered in another browser.
-        #
-        # So: offer the move, and keep the warning for the case where the
-        # student really did not do it.
-        return wrap(f"""
-            <h2>Ese codigo ya esta vinculado</h2>
-            <div class="name">{student['name']}</div>
-            <p>Esta asociado a otro navegador o a otro telefono. Si fuiste tu,
-            puedes pasarlo a este.</p>
-            <form method="post" action="/register/relink">
-              <input type="hidden" name="student_code" value="{student['student_code']}">
-              <button type="submit">Si, soy yo, vincular aqui</button>
-            </form>
-            <p style="margin-top:20px;color:#666">El cambio le aparece a tu
-            profesora. Si no eres tu, no sigas: avisale de inmediato.</p>
-        """)
-
-    return wrap(f"""
-        <h2>Confirma</h2>
-        <div class="name">{student['name']}</div>
-        <form method="post" action="/register/confirm">
-          <input type="hidden" name="student_code" value="{student['student_code']}">
-          <button type="submit">Si, soy yo</button>
-        </form>
-        <form method="get" action="/register">
-          <button type="submit" class="grey">No, volver</button>
-        </form>
-    """)
+def rescan_page(reason="Ese QR ya venció."):
+    return student_page(f"<p class='bad-title'>Vuelve a escanear</p><p>{e(reason)} "
+                        "Apunta la cámara al QR que está ahora en la pantalla.</p>")
 
 
-@app.post("/register/confirm", response_class=HTMLResponse)
-def step2_confirm(request: Request, student_code: str = Form(...)):
-    """Step 2: bind this browser to that student."""
-    return _finish_binding(request, student_code, moving=False)
+def accept_form(session, ticket, student=None, error=""):
+    msg = f"<div class='msg bad'>{e(error)}</div>" if error else ""
+    head = (f"<div class='course'>{e(session['course_name'])}</div>"
+            f"<p class='prof'>{e(session['teacher_name'])}</p>")
+    if student:
+        return student_page(f"""{head}{msg}
+          <div class="name">{e(student['name'])}</div>
+          <p class="carne">Carné {e(student['carne'])}</p>
+          <form method="post" action="/checkin/accept">
+            <input type="hidden" name="ticket" value="{e(ticket)}">
+            <button class="btn big" type="submit">Aceptar</button>
+          </form>""")
+    name_field = "" if session["has_roster"] else """
+            <label for="nombre">Nombre completo</label>
+            <input id="nombre" name="nombre" required maxlength="80" autocomplete="name">"""
+    return student_page(f"""{head}{msg}
+      <p><strong>Primera vez en este celular.</strong> Escribe tu carné una sola vez;
+      las próximas clases solo tocarás Aceptar.</p>
+      <form method="post" action="/checkin/accept">
+        <input type="hidden" name="ticket" value="{e(ticket)}">
+        <label for="carne">Carné</label>
+        <input id="carne" name="carne" required inputmode="text" autocapitalize="characters" autofocus>
+        {name_field}
+        <p style="margin-top:16px"><button class="btn big" type="submit">Aceptar</button></p>
+      </form>
+      <p class="hint">Usa siempre este mismo navegador para escanear.</p>""")
 
 
-@app.post("/register/relink", response_class=HTMLResponse)
-def relink(request: Request, student_code: str = Form(...)):
-    """Move a code that is already bound somewhere else to this browser."""
-    return _finish_binding(request, student_code, moving=True)
+def receipt_page(session, student, att, created):
+    title = "Asistencia recibida" if created else "Ya tenías asistencia en esta clase"
+    marked = local_time(att["marked_at"])
+    return student_page(f"""
+      <div class="okscreen"><div class="inner">
+        <div class="check">✓</div>
+        <p class="oktitle">{title}</p>
+        <div class="name">{e(student['name'])}</div>
+        <p class="okline">Carné {e(student['carne'])}</p>
+        <p class="okline">{e(session['course_name'])} · {e(session['teacher_name'])}</p>
+        <p class="okline">Marcada a las {marked}</p>
+        <div class="clock" id="clock">--:--:--</div>
+        <span class="live"><span class="dot"></span>hora actual, en vivo</span>
+        <div class="receipt">Comprobante<br><b>{e(att['receipt'])}</b></div>
+      </div></div>
+      <script>
+        // A live clock: a screenshot of this screen from another day, or
+        // another minute, shows a time that does not match the room's.
+        function tick() {{
+          document.getElementById('clock').textContent =
+            new Date().toLocaleTimeString('es-CO', {{ timeZone: 'America/Bogota', hour12: false }});
+        }}
+        tick(); setInterval(tick, 1000);
+      </script>""")
 
 
-def _finish_binding(request: Request, student_code: str, moving: bool):
-    device_id = request.cookies.get("device_id")
-    if not device_id:
-        return wrap("<p class='error'>No se pudo identificar este navegador</p>"
-                    "<p>Recarga la pagina e intenta de nuevo.</p>")
-
-    code = student_code.strip().upper()
-    conn = connect()
-    student = conn.execute(
-        "SELECT * FROM students WHERE UPPER(student_code) = ?", (code,)
-    ).fetchone()
-
-    if student is None:
-        conn.close()
-        return wrap("<p class='error'>Ese codigo no existe</p>" + CODE_FORM)
-
-    active = conn.execute(
-        "SELECT id FROM sessions WHERE active = 1 ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    status, other = bind_device(conn, student, device_id,
-                               active["id"] if active else None)
-    conn.close()
-
-    if status == "taken":
-        return wrap(f"<p class='error'>Este telefono ya esta registrado</p>"
-                    f"<div class='name'>{other['name']}</div>"
-                    f"<p>Un telefono solo puede pertenecer a un estudiante.</p>")
-
-    if status == "retry":
-        return wrap("<p class='error'>Intentalo otra vez</p>"
-                    "<p>Alguien uso ese codigo en el mismo instante.</p>")
-
-    headline = "Telefono vinculado de nuevo" if status == "moved" else "Telefono registrado"
-    note = ("<p style='color:#666'>Tu profesora vera que lo cambiaste de "
-            "navegador.</p>" if status == "moved" else "")
-
-    return wrap(
-        f"<p class='ok'>{headline}</p>"
-        f"<div class='name'>{student['name']}</div>"
-        f"<p>En clase, apunta la camara al QR de la pantalla. "
-        f"No vas a tener que escribir nada.</p>" + note
-    )
-
-
-# ---------------------------------------------------------------
-# CHECK-IN  (open to students, fast, no typing)
-# ---------------------------------------------------------------
-
-def check_nonce(conn, session_id: int, nonce: str):
-    row = conn.execute(
-        "SELECT * FROM nonces WHERE nonce = ? AND session_id = ?", (nonce, session_id)
-    ).fetchone()
-
-    if row is None:
-        return False, "Codigo invalido."
-
-    if datetime.now(timezone.utc) > datetime.fromisoformat(row["expires_at"]):
-        return False, "Este codigo ya expiro. Escanea el QR actual de la pantalla."
-
-    return True, ""
+def set_device_cookie(response: Response, device_id: str):
+    response.set_cookie("device_id", device_id, max_age=31536000,
+                        httponly=True, samesite="lax")
 
 
 @app.get("/checkin", response_class=HTMLResponse)
-def checkin(s: int, n: str, request: Request):
+def checkin(request: Request, s: int, n: str):
     device_id = request.cookies.get("device_id")
+    new_cookie = not device_id
+    if new_cookie:
+        device_id = secrets.token_hex(16)
+    ua = ua_of(request)
 
-    conn = connect()
-    student = None
-    if device_id:
-        student = conn.execute(
-            "SELECT * FROM students WHERE device_id = ?", (device_id,)
-        ).fetchone()
+    with db() as conn:
+        session = session_for_student(conn, s)
+        if not session or not session["active"]:
+            page = class_over_page()
+        else:
+            nonce = conn.execute("SELECT * FROM nonces WHERE nonce = %s AND session_id = %s",
+                                 (n, s)).fetchone()
+            if nonce is None or utcnow() > nonce["expires_at"]:
+                # Counted, not flagged: how often students hit an expired code
+                # is a usability number worth reporting.
+                log_event(conn, s, None, "qr_vencido", ua_text(ua), False, ua)
+                page = rescan_page()
+            else:
+                student = conn.execute("SELECT * FROM students WHERE device_id = %s",
+                                       (device_id,)).fetchone()
+                existing = None
+                if student:
+                    existing = conn.execute(
+                        "SELECT * FROM attendance WHERE session_id = %s AND student_id = %s",
+                        (s, student["id"])).fetchone()
+                if existing:
+                    page = receipt_page(session, student, existing, created=False)
+                else:
+                    ticket = secrets.token_urlsafe(16)
+                    conn.execute("INSERT INTO scan_tickets (token, session_id) VALUES (%s, %s)",
+                                 (ticket, s))
+                    page = accept_form(session, ticket, student)
 
-    # Not recognised. In the pilot this screen sent the student away to
-    # register, and for 7 of them that was a dead end: they were already
-    # registered, in another browser, so registering again told them their
-    # own code was taken.
-    #
-    # Now the code box is right here. The nonce will usually expire while
-    # they type, and that is fine: binding is the slow part and happens
-    # once. The next scan is instant.
-    if student is None:
-        conn.close()
-        response = HTMLResponse(wrap(f"""
-            <h2>Vincula este telefono</h2>
-            <p>Este navegador todavia no esta asociado a ningun estudiante.
-            Puede que te hayas registrado desde otra app.</p>
-            <form method="post" action="/checkin/link">
-              <input type="hidden" name="s" value="{s}">
-              <input type="hidden" name="n" value="{n}">
-              <input name="student_code" placeholder="Tu codigo" required autofocus
-                     autocapitalize="characters">
-              <button type="submit">Vincular</button>
-            </form>
-            <p style="margin-top:20px;color:#666">Se hace una sola vez desde
-            este navegador.</p>
-        """))
-        if not device_id:
-            response.set_cookie("device_id", secrets.token_hex(16),
-                                max_age=31536000, httponly=True, samesite="lax")
-        return response
-
-    # A closed session accepts nothing, even with a nonce that has not
-    # expired yet.
-    session_row = conn.execute(
-        "SELECT active FROM sessions WHERE id = ?", (s,)
-    ).fetchone()
-    if session_row is None or not session_row["active"]:
-        conn.close()
-        return wrap("<p class='error'>Esta clase ya termino</p>"
-                    "<p>Si crees que es un error, avisale a la profesora.</p>")
-
-    valid, reason = check_nonce(conn, s, n)
-    if not valid:
-        conn.close()
-        return wrap(f"<p class='error'>{reason}</p>")
-
-    message = record_attendance(conn, s, student["id"], n, "qr")
-    conn.close()
-    return wrap(f"{message}<div class='name'>{student['name']}</div>")
+    response = HTMLResponse(page)
+    if new_cookie:
+        set_device_cookie(response, device_id)
+    return response
 
 
-@app.post("/checkin/link", response_class=HTMLResponse)
-def checkin_link(request: Request,
-                 s: int = Form(...),
-                 n: str = Form(...),
-                 student_code: str = Form(...)):
-    """
-    Bind this browser from inside a check-in, then try to mark attendance.
-
-    This is the path the 7 students of the pilot needed and did not have.
-    """
+@app.post("/checkin/accept", response_class=HTMLResponse)
+def checkin_accept(request: Request, ticket: str = Form(...),
+                   carne: str = Form(""), nombre: str = Form("")):
     device_id = request.cookies.get("device_id")
     if not device_id:
-        return wrap("<p class='error'>No se pudo identificar este navegador</p>"
-                    "<p>Recarga la pagina e intenta de nuevo.</p>")
+        return student_page("<p class='bad-title'>Tu navegador no guardó la sesión</p>"
+                            "<p>Revisa que no estés bloqueando cookies y vuelve a escanear.</p>")
+    ua = ua_of(request)
 
-    code = student_code.strip().upper()
-    conn = connect()
-    student = conn.execute(
-        "SELECT * FROM students WHERE UPPER(student_code) = ?", (code,)
-    ).fetchone()
+    with db() as conn:
+        t = conn.execute("SELECT * FROM scan_tickets WHERE token = %s FOR UPDATE",
+                         (ticket,)).fetchone()
+        if not t or t["used_at"]:
+            return rescan_page("Ese escaneo ya se usó.")
+        if utcnow() - t["scanned_at"] > timedelta(seconds=TICKET_SECONDS):
+            return rescan_page("Pasó demasiado tiempo desde que escaneaste.")
+        session = session_for_student(conn, t["session_id"])
+        if not session or not session["active"]:
+            return class_over_page()
+        sid, course_id = session["id"], session["course_id"]
 
-    if student is None:
-        conn.close()
-        return wrap("<p class='error'>Ese codigo no existe</p>"
-                    "<p>Revisa como esta escrito. Si sigue sin funcionar, "
-                    "avisale a la profesora y te agrega a mano.</p>")
+        student = conn.execute("SELECT * FROM students WHERE device_id = %s",
+                               (device_id,)).fetchone()
 
-    status, other = bind_device(conn, student, device_id, s)
+        if student is None:
+            # First time in this browser: link it to the carne they type.
+            carne = normalize_carne(carne)
+            if not carne:
+                return accept_form(session, ticket, error="Escribe tu carné.")
+            student = conn.execute("SELECT * FROM students WHERE carne = %s",
+                                   (carne,)).fetchone()
 
-    if status == "taken":
-        conn.close()
-        return wrap(f"<p class='error'>Este telefono ya es de otro estudiante</p>"
-                    f"<div class='name'>{other['name']}</div>"
-                    f"<p>Un telefono solo puede marcar por una persona.</p>")
+            if session["has_roster"]:
+                if student is None or not enrollment(conn, course_id, student["id"]):
+                    log_event(conn, sid, student["id"] if student else None,
+                              "carne_no_en_lista", f"carné {carne} · {ua_text(ua)}", True, ua)
+                    return accept_form(session, ticket, error=(
+                        "Ese carné no está en la lista de esta clase. Revisa cómo lo "
+                        "escribiste; si está bien, avísale al profesor."))
+            else:
+                if student is None:
+                    nombre = re.sub(r"\s+", " ", nombre).strip()[:80]
+                    if not nombre:
+                        return accept_form(session, ticket, error="Escribe tu nombre completo.")
+                    conn.execute("INSERT INTO students (carne, name) VALUES (%s, %s) "
+                                 "ON CONFLICT (carne) DO NOTHING", (carne, nombre))
+                    student = conn.execute("SELECT * FROM students WHERE carne = %s",
+                                           (carne,)).fetchone()
+                conn.execute(
+                    "INSERT INTO enrollments (course_id, student_id, status) "
+                    "VALUES (%s, %s, 'pendiente') ON CONFLICT DO NOTHING",
+                    (course_id, student["id"]))
 
-    if status == "retry":
-        conn.close()
-        return wrap("<p class='error'>Intentalo otra vez</p>"
-                    "<p>Alguien uso ese codigo en el mismo instante.</p>")
+            status = bind_device(conn, student, device_id, sid)
+            if status == "taken":
+                return student_page("<p class='bad-title'>Este navegador ya es de otro estudiante</p>"
+                                    "<p>Un navegador solo puede marcar por una persona.</p>")
+            student = conn.execute("SELECT * FROM students WHERE id = %s",
+                                   (student["id"],)).fetchone()
+            log_event(conn, sid, student["id"], "vinculacion", ua_text(ua), False, ua)
+            if status == "moved":
+                log_event(conn, sid, student["id"], "cambio_dispositivo",
+                          f"ahora {ua_text(ua)}", True, ua)
+            check_burst(conn, sid, ua)
+        else:
+            # A browser the system knows. Whatever carne might be in the form
+            # is ignored: this browser marks for its owner and nobody else.
+            if not enrollment(conn, course_id, student["id"]):
+                if session["has_roster"]:
+                    log_event(conn, sid, student["id"], "carne_no_en_lista",
+                              f"carné {student['carne']} · {ua_text(ua)}", True, ua)
+                    return student_page(
+                        f"<div class='course'>{e(session['course_name'])}</div>"
+                        f"<p class='bad-title'>No estás en la lista de esta clase</p>"
+                        f"<p>{e(student['name'])}, avísale al profesor para que te agregue.</p>")
+                conn.execute(
+                    "INSERT INTO enrollments (course_id, student_id, status) "
+                    "VALUES (%s, %s, 'pendiente') ON CONFLICT DO NOTHING",
+                    (course_id, student["id"]))
 
-    # The session may have closed, or the nonce expired while they typed.
-    # Either way the binding above is already saved, so the next scan works.
-    session_row = conn.execute(
-        "SELECT active FROM sessions WHERE id = ?", (s,)
-    ).fetchone()
-    if session_row is None or not session_row["active"]:
-        conn.close()
-        return wrap(f"<p class='ok'>Telefono vinculado</p>"
-                    f"<div class='name'>{student['name']}</div>"
-                    f"<p>Esta clase ya termino. Avisale a la profesora para "
-                    f"que te marque a mano.</p>")
+        if ua["in_app"]:
+            seen = conn.execute(
+                "SELECT 1 FROM events WHERE session_id = %s AND student_id = %s "
+                "AND kind = 'desde_app'", (sid, student["id"])).fetchone()
+            if not seen:
+                log_event(conn, sid, student["id"], "desde_app", ua["in_app"], True, ua)
 
-    valid, _ = check_nonce(conn, s, n)
-    if not valid:
-        conn.close()
-        return wrap(f"<p class='ok'>Telefono vinculado</p>"
-                    f"<div class='name'>{student['name']}</div>"
-                    f"<p>Ahora escanea otra vez el QR de la pantalla. "
-                    f"Esta vez no tienes que escribir nada.</p>")
-
-    message = record_attendance(conn, s, student["id"], n, "qr")
-    conn.close()
-    return wrap(f"{message}<div class='name'>{student['name']}</div>")
+        att, created = record_attendance(conn, session, student, "qr", ua)
+        conn.execute("UPDATE scan_tickets SET used_at = now() WHERE token = %s", (ticket,))
+        return receipt_page(session, student, att, created)
 
 
-@app.post("/manual")
-def manual_override(request: Request,
-                    student_code: str = Form(...),
-                    session_id: int = Form(...)):
+# ---------------------------------------------------------------
+# REPORTS
+# ---------------------------------------------------------------
+
+def build_report(conn, session, late_minutes: int):
     """
-    Teacher override: for the student with a dead battery, no data, or who
-    never registered a phone.
-
-    With the roster loaded this works for anyone on the list, registered or
-    not. Before the roster existed it did not.
+    One row per student who belongs to the class or who was marked in it.
+    The same rows feed the screen, the PDF, Excel and CSV, so the four can
+    never disagree.
     """
-    if not is_teacher(request):
-        return Response(status_code=401)
+    groups = session["sections"]
+    students = conn.execute("""
+        SELECT st.id, st.carne, st.name, en.status, en.section FROM students st
+        LEFT JOIN enrollments en ON en.student_id = st.id AND en.course_id = %s
+        WHERE (en.course_id IS NOT NULL
+               AND (%s::text[] IS NULL OR en.section = ANY(%s::text[])))
+           OR st.id IN (SELECT student_id FROM attendance WHERE session_id = %s)
+        ORDER BY st.name
+    """, (session["course_id"], groups, groups, session["id"])).fetchall()
+    attendance = {a["student_id"]: a for a in conn.execute(
+        "SELECT * FROM attendance WHERE session_id = %s", (session["id"],)).fetchall()}
+    moved = {r["student_id"] for r in conn.execute(
+        "SELECT DISTINCT student_id FROM device_changes WHERE session_id = %s",
+        (session["id"],)).fetchall()}
+    notes = {}
+    for ev in conn.execute(
+            "SELECT * FROM events WHERE session_id = %s AND review AND student_id IS NOT NULL "
+            "ORDER BY created_at", (session["id"],)).fetchall():
+        notes.setdefault(ev["student_id"], []).append(EVENT_LABELS.get(ev["kind"], ev["kind"]))
 
-    conn = connect()
-    student = conn.execute(
-        "SELECT * FROM students WHERE UPPER(student_code) = ?",
-        (student_code.strip().upper(),),
-    ).fetchone()
+    rows = []
+    for st in students:
+        a = attendance.get(st["id"])
+        minutes = None
+        if a:
+            minutes = int((a["marked_at"] - session["started_at"]).total_seconds() // 60)
+            if a["method"] == "manual":
+                state = "Manual"
+            elif minutes > late_minutes:
+                state = "Tarde"
+            else:
+                state = "Presente"
+        else:
+            state = "Ausente"
+        observation = list(dict.fromkeys(notes.get(st["id"], [])))
+        if st["status"] == "pendiente":
+            observation.insert(0, "Se unió marcando; falta aprobarlo")
+        if groups and st["section"] and st["section"] not in groups:
+            observation.insert(0, f"Es de otro grupo ({short_section(st['section'])})")
+        rows.append({
+            "carne": st["carne"], "nombre": st["name"],
+            "grupo": short_section(st["section"]) if st["section"] else "",
+            "estado": state,
+            "hora": local_time(a["marked_at"]) if a else "",
+            "retraso_min": minutes if a else "",
+            "metodo": ("QR" if a["method"] == "qr" else "Manual") if a else "",
+            "navegador": (a["browser"] or "") if a else "",
+            "sistema": (a["os"] or "") if a else "",
+            "app": (a["in_app"] or "") if a else "",
+            "celular": f"Celular #{a['device_no']}" if a and a["device_no"] else "",
+            "cambio_dispositivo": "Sí" if st["id"] in moved else "No",
+            "comprobante": a["receipt"] if a else "",
+            "observacion": "; ".join(observation),
+        })
+    return rows
 
-    if student is None:
-        conn.close()
-        return {"message": "Ese codigo no esta en la lista del curso."}
 
-    result = record_attendance(conn, session_id, student["id"], None, "manual")
-    conn.close()
-    name = student["name"]
-    return {"message": f"{name}: agregado." if "registrada" in result
-            else f"{name}: ya estaba."}
+REPORT_COLUMNS = [
+    ("carne", "Carné"), ("nombre", "Nombre"), ("grupo", "Grupo"), ("estado", "Estado"),
+    ("hora", "Hora"),
+    ("retraso_min", "Minutos desde el inicio"), ("metodo", "Método"),
+    ("navegador", "Navegador"), ("sistema", "Sistema"), ("app", "App de origen"),
+    ("celular", "Celular"), ("cambio_dispositivo", "Cambio de dispositivo"),
+    ("comprobante", "Comprobante"), ("observacion", "Observación"),
+]
 
 
-def record_attendance(conn, session_id: int, student_id: int,
-                      nonce: str | None, method: str) -> str:
-    try:
-        conn.execute(
-            "INSERT INTO attendance (session_id, student_id, timestamp, method, nonce_used) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (session_id, student_id, now(), method, nonce),
-        )
-        conn.commit()
-        return "<p class='ok'>Asistencia registrada</p>"
-    except sqlite3.IntegrityError:
-        return "<p class='ok'>Ya estabas registrado en esta clase</p>"
+def report_context(request: Request, session_id: int, late: int):
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        session = own_session(conn, teacher, session_id)
+        rows = build_report(conn, session, late)
+        alerts = conn.execute("""
+            SELECT ev.*, st.name FROM events ev LEFT JOIN students st ON st.id = ev.student_id
+            WHERE ev.session_id = %s AND ev.review ORDER BY ev.created_at
+        """, (session_id,)).fetchall()
+        expired = conn.execute("SELECT COUNT(*) AS n FROM events WHERE session_id = %s "
+                               "AND kind = 'qr_vencido'", (session_id,)).fetchone()["n"]
+    return teacher, session, rows, alerts, expired
+
+
+def file_name(session, ext):
+    stem = re.sub(r"[^A-Za-z0-9]+", "_", _plain(session["course_name"])).strip("_") or "clase"
+    day = session["started_at"].astimezone(LOCAL_TZ).strftime("%Y-%m-%d")
+    return f"asistencia_{stem}_{day}.{ext}"
+
+
+@app.get("/session/{session_id}/report", response_class=HTMLResponse)
+def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MINUTES):
+    teacher, session, rows, alerts, expired = report_context(request, session_id, tarde)
+    count = lambda state: sum(1 for r in rows if r["estado"] == state)
+    present = count("Presente") + count("Tarde") + count("Manual")
+    head = "".join(f"<th>{label}</th>" for _, label in REPORT_COLUMNS)
+    body = "".join(
+        "<tr>" + "".join(
+            f"<td>{e(r[key])}</td>" if key != "estado" else
+            f"<td><span class='pill {'bad' if r[key] == 'Ausente' else 'warn' if r[key] in ('Tarde', 'Manual') else 'ok'}'>{e(r[key])}</span></td>"
+            for key, _ in REPORT_COLUMNS) + "</tr>"
+        for r in rows)
+    alert_items = "".join(
+        f"<li>{local_time(a['created_at'])} · {e(a['name'] or 'Sin estudiante')} · "
+        f"{e(EVENT_LABELS.get(a['kind'], a['kind']))}{' (' + e(a['detail']) + ')' if a['detail'] else ''}</li>"
+        for a in alerts)
+    groups_line = (f"<p>Grupos de esta sesión: {e(', '.join(short_section(g) for g in session['sections']))}</p>"
+                   if session["sections"] else "")
+    alerts_html = (f"<ul>{alert_items}</ul>" if alert_items
+                   else "<p class='muted'>Nada que revisar en esta clase.</p>")
+    ended = local(session["ended_at"]) if session["ended_at"] else "en curso"
+    live_link = (f"<a class='btn' href='/session/{session_id}/live'>Volver a la pantalla en vivo</a>"
+                 if session["active"] else "")
+    institution = f"{e(teacher['institution'])} · " if teacher["institution"] else ""
+
+    return teacher_page(f"Reporte {session['course_name']}", f"""
+      <style>
+        .stats {{ display:flex; gap:10px; flex-wrap:wrap; margin:10px 0 18px; }}
+        .stat {{ background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 14px; }}
+        .stat b {{ display:block; font-size:26px; }}
+        .sign {{ margin-top:48px; display:flex; gap:40px; flex-wrap:wrap; }}
+        .sign div {{ border-top:1px solid var(--ink); padding-top:6px; min-width:240px; }}
+        @media print {{
+          header.bar, .noprint {{ display:none !important; }}
+          body {{ background:#fff; }} .wrap {{ max-width:none; padding:0; }}
+          table {{ font-size:10px; }} th, td {{ padding:4px 5px; }}
+          .table-wrap {{ overflow:visible; }}
+        }}
+      </style>
+      <div class="noprint" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+        <button class="btn" type="button" onclick="window.print()">Imprimir o guardar PDF</button>
+        <a class="btn light" href="/session/{session_id}/export.xlsx?tarde={tarde}">Descargar Excel</a>
+        <a class="btn light" href="/session/{session_id}/export.csv?tarde={tarde}">Descargar CSV</a>
+        {live_link}
+        <a class="btn grey" href="/course/{session['course_id']}">Volver a la clase</a>
+      </div>
+      <p class="muted" style="margin:0">{institution}Reporte de asistencia</p>
+      <h1 style="margin-top:4px">{e(session['course_name'])}</h1>
+      <p>Profesor: {e(teacher['name'])} · Inicio: {local(session['started_at'])} · Fin: {ended} · Sesión #{session_id}</p>
+      {groups_line}
+      <div class="stats">
+        <div class="stat"><b>{present} de {len(rows)}</b>asistieron</div>
+        <div class="stat"><b>{count('Ausente')}</b>ausentes</div>
+        <div class="stat"><b>{count('Tarde')}</b>llegaron después de {tarde} min</div>
+        <div class="stat"><b>{count('Manual')}</b>marcados a mano</div>
+        <div class="stat"><b>{len(alerts)}</b>por revisar</div>
+        <div class="stat"><b>{expired}</b>escaneos de QR vencido</div>
+      </div>
+      <form class="noprint" method="get" style="display:flex;gap:8px;align-items:center;max-width:420px;margin-bottom:12px">
+        <label for="tarde" style="margin:0;white-space:nowrap">Tarde después de</label>
+        <input id="tarde" name="tarde" type="number" min="0" max="240" value="{tarde}" style="width:90px">
+        <span>min</span><button class="btn small" type="submit">Aplicar</button>
+      </form>
+      <div class="table-wrap"><table><tr>{head}</tr>{body}</table></div>
+      <h2>Por revisar</h2>
+      {alerts_html}
+      <p class="hint">Estas señales son pistas, no pruebas. Si algo no cuadra, pregúntale al estudiante.</p>
+      <div class="sign"><div>Firma del profesor</div><div>Fecha</div></div>
+    """, teacher)
+
+
+@app.get("/session/{session_id}/export.csv")
+def export_csv(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MINUTES):
+    _, session, rows, _, _ = report_context(request, session_id, tarde)
+    buffer = io.StringIO()
+    # The csv module quotes any value that contains a comma; version 1 did not,
+    # and a name like "Pérez, Juan" shifted every column after it.
+    writer = csv.writer(buffer)
+    writer.writerow([label for _, label in REPORT_COLUMNS])
+    for r in rows:
+        writer.writerow([r[key] for key, _ in REPORT_COLUMNS])
+    data = ("﻿" + buffer.getvalue()).encode("utf-8")  # BOM: Excel reads the accents
+    return Response(data, media_type="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename={file_name(session, 'csv')}"})
+
+
+@app.get("/session/{session_id}/export.xlsx")
+def export_xlsx(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MINUTES):
+    import openpyxl
+    from openpyxl.styles import Font
+    _, session, rows, _, _ = report_context(request, session_id, tarde)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Asistencia"
+    ws.append([label for _, label in REPORT_COLUMNS])
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    for r in rows:
+        ws.append([r[key] for key, _ in REPORT_COLUMNS])
+    widths = [14, 30, 12, 11, 10, 12, 9, 16, 10, 14, 12, 12, 16, 50]
+    for i, w in enumerate(widths):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i + 1)].width = w
+    ws.freeze_panes = "A2"
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return Response(buffer.getvalue(),
+                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f"attachment; filename={file_name(session, 'xlsx')}"})
