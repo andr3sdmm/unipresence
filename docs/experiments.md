@@ -24,3 +24,41 @@ Three additional problems were identified during a review of the design with an 
 **What I decided:** I decided to ask for the student's private code before showing or requesting their name so the course list is not exposed during registration. I also decided to use English for the repository and technical documentation, while keeping the student-facing interface in Spanish. For the current prototype, teacher access uses a shared password stored outside the repository as an environment variable. A future production version should use Universidad del Norte's institutional login instead.
 
 **Still open:** The timestamps in the exported CSV are still displayed in UTC and need to be converted to the appropriate local time.
+
+
+## Day 4 — September 22, 2026: first classroom pilot
+
+**What I tested:** The system ran in a real genetics lab at Universidad del Norte: 22 students, the professor operating it alone. Each student received a printed slip with their private code, registered through a registration QR, and then scanned the rotating attendance QR.
+
+**What happened:** 15 students checked in. 7 could not.
+
+**What failed:** The professor's video shows the same sequence for the students who failed. A student scans the attendance QR, is told "Primero registrate", types the code from the slip, and is told "Ese codigo ya fue usado". Both screens were the system working exactly as written, and both were wrong: the student had registered minutes earlier.
+
+The cause: students opened the registration link inside WhatsApp, then scanned the attendance QR with the phone camera, which opens Safari. The binding between a student and a phone was stored in a browser cookie, and each browser keeps its own cookies. Two browsers, two cookie jars, one student the system could no longer recognize. I had built device binding on something narrower than a device.
+
+The pilot also lost its stored data when the free Render instance went to sleep.
+
+Evidence: `media/dia04_01_primero_registrate.png`, `media/dia04_03_codigo_ya_usado.jpg`, `media/dia04_04_proyector.jpg`, `media/dia04_05_papelito.jpg`.
+
+**What I decided:** The problem was not cheating and not the network. It was the number of steps. Each one (keeping a slip, typing a code, using a separate registration link, crossing from one app to another) was a point where a real student could fall out of the flow. Immediate changes:
+
+1. A student who is not recognized at check-in can type their code right there and bind that browser, instead of being sent away.
+2. Re-binding is never silent: every change is written to a `device_changes` table, counted on the teacher's screen during class, and marked in the CSV. The one-phone-one-student rule is enforced by visibility rather than by refusal.
+3. The error message that implied the student had used someone else's code was replaced with one that explains the real cause.
+
+Evidence of the fix: `media/dia04_06_casilla_vincular.png`, `media/dia04_07_vinculado_de_nuevo.png`, `media/dia04_08_cambio_visible_profesor.png`.
+
+**Still open:** Persistent storage, and a flow with even fewer steps. Both led to version 2.
+
+
+## Version 2 — October 2026
+
+**Why:** The September 22 pilot showed that the real failure point was friction for students, and that the free deployment could lose data.
+
+**What I built:** Students scan one QR, see the class name and tap "Aceptar". The first time, they enter their university code, which binds the phone; slips and the separate registration link are no longer needed. The browser used for each check-in is logged for fraud analysis. Teachers have individual accounts (optionally restricted by a signup code), can create classes with or without a student list, upload the list once through the interface, and export attendance to CSV or PDF. All data is stored in Postgres, and the project has automated tests.
+
+**Design trade-off:** University codes are not secret, so they cannot protect registration the way private slips did. I accepted this on purpose: device changes are allowed but always recorded and shown to the teacher, so a misused code becomes visible instead of locking out a present student.
+
+**Next:** Time a manual roll call (paper list, no sign-in sheet) in a small class and then in a large one, to have a baseline. Only then run the version 2 pilot and compare. Results go in `docs/results.md`.
+
+<!-- Agregar aquí: fecha exacta en que se terminó la v2, qué se probó y qué falló durante la reescritura. -->

@@ -20,13 +20,21 @@ A student could take a screenshot of the QR code and send it to someone who is n
 
 A student could get another student's code and try to register attendance with it. Before the assigned-code system was added, nothing prevented this because anyone could register using any valid code.
 
-Now, each student receives a secret code privately. The security of this system depends on keeping that code secret, not just on the code being single-use.
+**Version 1.** Each student received a secret code privately on a printed slip. Security depended on keeping that code secret. If an attacker got another student's code before the real owner registered, the attack could still work, but it became noticeable: when the real student tried to register, the code was rejected as already used.
 
-If an attacker gets another student's code before the real owner registers, the attack can still work. The single-use system does not prevent this situation, but it makes the attack noticeable because when the real student tries to register, the code has already been used and will be rejected.
+**What the pilot showed.** On September 22, 2026, that same rejection hit 7 honest students. Their registration was stored in a browser cookie; they had registered inside WhatsApp's browser and then checked in from Safari, so the system treated them as new and refused their own code. A rule meant to stop impostors was locking out present students.
+
+**Version 2.** Students bind their phone with their university code, which is not secret. A student who knows a classmate's code can therefore move that classmate's registration to another phone. The system allows this on purpose, but never silently: every device change is recorded, counted on the teacher's screen while class runs, and marked in the export, together with the browser used. The attack is not prevented; it is made visible to the person who can act on it.
 
 ### Registering several people from one phone
 
-One student could try to register attendance for several classmates using the same phone. The system prevents this by associating the device with the first registered student. I tested this attack, and the system displayed: "Este teléfono ya está registrado — Andres Marino."
+One student could try to register attendance for several classmates using the same phone. Version 1 prevented this by associating the device with the first registered student. I tested this attack, and the system displayed: "Este teléfono ya está registrado — Andres Marino." In version 2, switching codes on a phone is recorded as a device change and shown to the teacher.
+
+<!-- verificar con el código de la v2: si un mismo teléfono puede marcar a dos estudiantes en la misma sesión, o si eso se bloquea -->
+
+### Device binding narrower than a device
+
+Found in the September 22 pilot, not in testing. Binding a student to a "phone" through a cookie actually binds them to one browser on that phone. Messaging apps open links in their own built-in browser, so a single phone can look like several devices. This caused false rejections rather than fraud, but it means the binding is weaker evidence of "same phone" than it appears.
 
 ### Live relay over video call
 
@@ -54,10 +62,8 @@ GPS was considered as a way to verify that students were physically near the cla
 
 The system still has some risks that it does not completely solve. A student may be able to relay attendance information live to someone outside the classroom.
 
-The assigned-code system also depends on how the codes are distributed. If the professor reads the codes aloud or sends them to a class WhatsApp group, the protection provided by secret individual codes can fail. This means part of the system's security depends on a step that happens outside the application.
+University codes are not secret, so in version 2 a student can move a classmate's registration to their own phone. The system records and displays this instead of preventing it. Detection depends on the teacher looking at the device-change count and the export.
 
-Teacher authentication also has an important limitation. The current prototype uses a shared password, so it can verify that someone knows the teacher password but cannot identify which individual teacher performed an action. If three people know the password, for example, there is no way to determine which one manually marked a student as present or performed another action.
+Version 1 used a shared teacher password, which could not identify which teacher performed an action. Version 2 replaces it with individual teacher accounts, so actions can be associated with a specific account. Anyone who knows the optional signup code can still create a teacher account; the signup code is a shared secret. Integrating Universidad del Norte's institutional login would close this gap and is outside the scope of the current prototype.
 
-If the shared password is leaked, it must be changed and the new password must be communicated to every authorized user. A stronger solution would be to integrate UniPresence with Universidad del Norte's institutional authentication system so that each professor has an individual account and actions can be associated with a specific user. This is outside the scope of the current prototype.
-
-Finally, the free Render plan can put the service to sleep after inactivity, which means the first request may take almost a minute to respond. This is not a security vulnerability, but it is an operational limitation of the current prototype.
+Version 1 ran on the free Render plan, which put the service to sleep after inactivity and lost stored data during the September 22 pilot. Version 2 stores all data in Postgres, so data survives restarts.
