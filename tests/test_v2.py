@@ -103,7 +103,7 @@ def test_first_checkin_then_one_tap():
     s = student()
     page = scan(s, t, sid).text
     assert "Primera vez en este celular" in page
-    r = s.post("/checkin/accept", data={"ticket": ticket_of(page), "carne": "2021104567"})
+    r = s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(page), "carne": "2021104567"})
     assert "Asistencia recibida" in r.text and "María Fernanda Rojas" in r.text
     assert re.search(r"C\d+-\d{4}-[A-Z2-9]{4}", r.text)
 
@@ -111,14 +111,14 @@ def test_first_checkin_then_one_tap():
     sid2 = start(t, sql("SELECT course_id FROM sessions WHERE id = %s", (sid,))[0][0])
     page2 = scan(s, t, sid2).text
     assert "Aceptar" in page2 and "Primera vez" not in page2 and "María Fernanda Rojas" in page2
-    assert "Asistencia recibida" in s.post("/checkin/accept", data={"ticket": ticket_of(page2)}).text
+    assert "Asistencia recibida" in s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(page2)}).text
 
 
 def test_second_scan_same_class_shows_existing_receipt():
     t = teacher()
     sid = start(t, create_course(t, roster=ROSTER))
     s = student()
-    s.post("/checkin/accept", data={"ticket": ticket_of(scan(s, t, sid).text), "carne": "2021104567"})
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text), "carne": "2021104567"})
     assert "Ya tenías asistencia" in scan(s, t, sid).text
     assert sql("SELECT COUNT(*) FROM attendance")[0][0] == 1
 
@@ -137,28 +137,62 @@ def test_ticket_cannot_be_used_twice():
     sid = start(t, create_course(t, roster=ROSTER))
     s = student()
     tk = ticket_of(scan(s, t, sid).text)
-    s.post("/checkin/accept", data={"ticket": tk, "carne": "2021104567"})
-    assert "ya se usó" in s.post("/checkin/accept", data={"ticket": tk, "carne": "2021104567"}).text
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": tk, "carne": "2021104567"})
+    assert "ya se usó" in s.post("/checkin/accept", data={"acepto": "1", "ticket": tk, "carne": "2021104567"}).text
 
 
-def test_carne_not_on_list_is_refused_and_flagged():
+def test_carne_not_on_list_asks_for_name_then_goes_to_review():
+    """Never lock a present student out: not refused, marked as pending and flagged."""
     t = teacher()
     sid = start(t, create_course(t, roster=ROSTER))
     s = student()
-    r = s.post("/checkin/accept", data={"ticket": ticket_of(scan(s, t, sid).text), "carne": "9999999"})
-    assert "no está en la lista" in r.text
+    tk = ticket_of(scan(s, t, sid).text)
+    r = s.post("/checkin/accept", data={"acepto": "1", "ticket": tk, "carne": "9999999"})
+    assert "No encontramos" in r.text and 'name="nombre"' in r.text
     assert sql("SELECT COUNT(*) FROM attendance")[0][0] == 0
+    r = s.post("/checkin/accept", data={"acepto": "1", "ticket": tk, "carne": "9999999", "nombre": "Eva Marin"})
+    assert "Asistencia recibida" in r.text
+    assert sql("SELECT en.status FROM enrollments en JOIN students st ON st.id = en.student_id "
+               "WHERE st.carne = '9999999'")[0][0] == "pendiente"
     assert sql("SELECT review FROM events WHERE kind = 'carne_no_en_lista'")[0][0] is True
+    labels = [a["label"] for a in t.get(f"/session/{sid}/state").json()["alerts"]]
+    assert main.EVENT_LABELS["carne_no_en_lista"] in labels
+
+
+def test_brightspace_list_matches_the_username_students_know():
+    """Uninorte case, 19 Oct 2026: OrgDefinedId is a number students do not know."""
+    roster = ("OrgDefinedId,Last Name,First Name,Email\n"
+              "170001,GOMEZ DIAZ,ANA,agomez@uninorte.edu.co\n"
+              "170002,PEREZ ROA,LUIS,lperez@uninorte.edu.co\n")
+    t = teacher()
+    sid = start(t, create_course(t, roster=roster))
+    assert sql("SELECT username FROM students ORDER BY carne") == [("AGOMEZ",), ("LPEREZ",)]
+    assert not sql("SELECT 1 FROM students WHERE username LIKE '%%@%%'")  # the address is never kept
+    ana = student()
+    r = ana.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(ana, t, sid).text),
+                                          "carne": "agomez"})
+    assert "Asistencia recibida" in r.text and "Ana Gomez Diaz" in r.text
+    luis = student(ANDROID_CHROME)
+    r = luis.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(luis, t, sid).text),
+                                           "carne": "LPerez@uninorte.edu.co"})
+    assert "Luis Perez Roa" in r.text
+    assert sql("SELECT COUNT(*) FROM events WHERE kind = 'carne_no_en_lista'")[0][0] == 0
+
+
+def test_national_id_column_is_never_used_as_key():
+    t = teacher()
+    create_course(t, roster="Nombre,Cedula\nAna Gomez,1045678901\n")
+    assert sql("SELECT COUNT(*) FROM students")[0][0] == 0
 
 
 def test_known_browser_cannot_mark_for_a_friend():
     t = teacher()
     sid = start(t, create_course(t, roster=ROSTER))
     s = student()
-    s.post("/checkin/accept", data={"ticket": ticket_of(scan(s, t, sid).text), "carne": "2021104567"})
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text), "carne": "2021104567"})
     sid2 = start(t, sql("SELECT course_id FROM sessions WHERE id = %s", (sid,))[0][0])
     # The form for a known browser has no carne field; a crafted one is ignored.
-    r = s.post("/checkin/accept", data={"ticket": ticket_of(scan(s, t, sid2).text),
+    r = s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid2).text),
                                         "carne": "2021104568"})
     assert "María Fernanda Rojas" in r.text
     marked = {row[0] for row in sql("SELECT st.carne FROM attendance a JOIN students st "
@@ -171,11 +205,11 @@ def test_private_window_with_friends_carne_goes_to_review():
     t = teacher()
     sid = start(t, create_course(t, roster=ROSTER))
     friend = student(IPHONE)
-    friend.post("/checkin/accept", data={"ticket": ticket_of(scan(friend, t, sid).text),
+    friend.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(friend, t, sid).text),
                                          "carne": "2021104568"})
     sid2 = start(t, sql("SELECT course_id FROM sessions WHERE id = %s", (sid,))[0][0])
     incognito = student(ANDROID_CHROME)
-    r = incognito.post("/checkin/accept", data={"ticket": ticket_of(scan(incognito, t, sid2).text),
+    r = incognito.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(incognito, t, sid2).text),
                                                 "carne": "2021104568"})
     assert "Asistencia recibida" in r.text  # not blocked...
     state = t.get(f"/session/{sid2}/state").json()
@@ -191,7 +225,7 @@ def test_class_without_list_builds_itself_and_needs_approval():
     s = student()
     page = scan(s, t, sid).text
     assert 'name="nombre"' in page
-    r = s.post("/checkin/accept", data={"ticket": ticket_of(page), "carne": "2021200001",
+    r = s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(page), "carne": "2021200001",
                                         "nombre": "Santiago Herrera"})
     assert "Asistencia recibida" in r.text
     assert sql("SELECT status FROM enrollments")[0][0] == "pendiente"
@@ -204,7 +238,7 @@ def test_burst_of_new_links_is_flagged():
     sid = start(t, create_course(t, roster=""))
     for i in range(3):
         s = student(ANDROID_CHROME)
-        s.post("/checkin/accept", data={"ticket": ticket_of(scan(s, t, sid).text),
+        s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text),
                                         "carne": f"20213000{i}", "nombre": f"Estudiante {i}"})
     assert sql("SELECT COUNT(*) FROM events WHERE kind = 'rafaga' AND review")[0][0] == 1
 
@@ -213,7 +247,7 @@ def test_link_opened_inside_instagram_is_flagged():
     t = teacher()
     sid = start(t, create_course(t, roster=ROSTER))
     s = student(INSTAGRAM)
-    s.post("/checkin/accept", data={"ticket": ticket_of(scan(s, t, sid).text), "carne": "2021104569"})
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text), "carne": "2021104569"})
     assert sql("SELECT detail FROM events WHERE kind = 'desde_app'")[0][0] == "Instagram"
     assert sql("SELECT in_app, browser, os FROM attendance")[0] == ("Instagram", "Safari", "iOS")
 
@@ -224,7 +258,7 @@ def test_closed_class_accepts_nothing():
     s = student()
     page = scan(s, t, sid).text
     t.post(f"/session/{sid}/end", follow_redirects=False)
-    r = s.post("/checkin/accept", data={"ticket": ticket_of(page), "carne": "2021104567"})
+    r = s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(page), "carne": "2021104567"})
     assert "Vuelve a escanear" in r.text or "ya terminó" in r.text
     assert sql("SELECT COUNT(*) FROM attendance")[0][0] == 0
 
@@ -234,7 +268,7 @@ def test_manual_mark_and_reports():
     cid = create_course(t, roster=ROSTER)
     sid = start(t, cid)
     s = student()
-    s.post("/checkin/accept", data={"ticket": ticket_of(scan(s, t, sid).text), "carne": "2021104567"})
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text), "carne": "2021104567"})
     juan = sql("SELECT id FROM students WHERE carne = '2021104568'")[0][0]
     assert "marcado a mano" in t.post(f"/session/{sid}/manual", data={"student_id": juan}).json()["message"]
     t.post(f"/session/{sid}/end", follow_redirects=False)
@@ -273,7 +307,7 @@ def test_student_typed_name_is_escaped_on_teacher_pages():
     cid = create_course(t, roster="")
     sid = start(t, cid)
     s = student()
-    s.post("/checkin/accept", data={"ticket": ticket_of(scan(s, t, sid).text),
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text),
                                     "carne": "2021400001", "nombre": "<script>alert(1)</script>"})
     page = t.get(f"/course/{cid}").text
     assert "<script>alert(1)</script>" not in page
@@ -357,9 +391,223 @@ def test_choose_todays_groups_when_class_has_several():
 
     # Eva, from the other group, shows up anyway: she is marked and flagged in the report.
     s = student()
-    s.post("/checkin/accept", data={"ticket": ticket_of(scan(s, t, sid).text), "carne": "180003"})
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text), "carne": "180003"})
     rows = list(csv.reader(io.StringIO(t.get(f"/session/{sid}/export.csv").content.decode("utf-8-sig"))))
     by_name = {r[1]: dict(zip(rows[0], r)) for r in rows[1:]}
     assert set(by_name) == {"Ana Rojas", "Luis Diaz", "Eva Soto"}
     assert "otro grupo" in by_name["Eva Soto"]["Observación"]
     assert by_name["Ana Rojas"]["Grupo"] == "Grupo 3614"
+
+
+def test_delete_class_needs_its_name_and_keeps_shared_students():
+    t = teacher()
+    test_class = create_course(t, name="Prueba", roster="Ana Uno\t2021900001\nLuis Dos\t2021900002")
+    real = create_course(t, name="Genética", roster="Luis Dos\t2021900002")
+    sid = start(t, test_class)
+    s = student()
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text), "carne": "2021900001"})
+
+    r = t.post(f"/course/{test_class}/delete", data={"confirm_name": "otra cosa"}, follow_redirects=False)
+    assert "error=1" in r.headers["location"]
+    assert sql("SELECT COUNT(*) FROM courses")[0][0] == 2
+
+    t.post(f"/course/{test_class}/delete", data={"confirm_name": "prueba"})
+    assert [r[0] for r in sql("SELECT name FROM courses")] == ["Genética"]
+    # Ana belonged only to the test class: gone. Luis is also in Genética: kept.
+    assert [r[0] for r in sql("SELECT carne FROM students")] == ["2021900002"]
+    assert sql("SELECT COUNT(*) FROM attendance")[0][0] == 0
+    assert t.get(f"/course/{real}").status_code == 200
+
+
+def test_unlink_phone_lets_the_real_student_link_without_alert():
+    """A carne linked to the wrong phone during a test, then unlinked by the professor."""
+    t = teacher()
+    cid = create_course(t, roster=ROSTER)
+    sid = start(t, cid)
+    test_phone = student()
+    test_phone.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(test_phone, t, sid).text),
+                                             "carne": "2021104567"})
+    sid_id = sql("SELECT id FROM students WHERE carne = '2021104567'")[0][0]
+    t.post(f"/course/{cid}/unlink", data={"student_id": sid_id})
+    assert sql("SELECT device_id FROM students WHERE id = %s", (sid_id,))[0][0] is None
+
+    sid2 = start(t, cid)
+    real_phone = student(ANDROID_CHROME)
+    page = scan(real_phone, t, sid2).text
+    assert "Primera vez en este celular" in page
+    real_phone.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(page), "carne": "2021104567"})
+    assert t.get(f"/session/{sid2}/state").json()["alerts"] == []
+    # The test phone is no longer anyone's: it is asked for a carne again.
+    assert "Primera vez en este celular" in scan(test_phone, t, sid2).text
+
+
+def test_professor_corrects_a_mistyped_carne():
+    t = teacher()
+    cid = create_course(t, roster="")
+    sid = start(t, cid)
+    s = student()
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text),
+                                    "carne": "202110456", "nombre": "Juan Perez"})  # missing a digit
+    wrong = sql("SELECT id FROM students WHERE carne = '202110456'")[0][0]
+    t.post(f"/course/{cid}/student/{wrong}/edit", data={"carne": "2021104567", "name": "Juan Pérez"})
+    assert sql("SELECT carne, name FROM students") == [("2021104567", "Juan Pérez")]
+    assert sql("SELECT COUNT(*) FROM attendance")[0][0] == 1
+    # The same phone keeps working, now as the right carne.
+    sid2 = start(t, cid)
+    r = s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid2).text)})
+    assert "2021104567" in r.text
+
+
+def test_mistyped_carne_merges_into_the_listed_student():
+    t = teacher()
+    other = create_course(t, name="Con lista", roster="Ana Gómez\t2021500001")
+    cid = create_course(t, name="Sin lista", roster="")
+    sid = start(t, cid)
+    s = student()
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text),
+                                    "carne": "202150000", "nombre": "Ana G"})
+    wrong = sql("SELECT id FROM students WHERE carne = '202150000'")[0][0]
+    t.post(f"/course/{cid}/student/{wrong}/edit", data={"carne": "2021500001", "name": "Ana G"})
+    rows = sql("SELECT carne, name, device_id IS NOT NULL FROM students")
+    assert rows == [("2021500001", "Ana Gómez", True)]  # one record, the list's name, phone kept
+    assert sql("SELECT COUNT(*) FROM enrollments")[0][0] == 2
+    assert sql("SELECT COUNT(*) FROM attendance")[0][0] == 1
+
+
+def test_professor_rejects_a_flagged_checkin_and_it_stays_on_record():
+    t = teacher()
+    sid = start(t, create_course(t, roster=ROSTER))
+    friend = student(IPHONE)
+    friend.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(friend, t, sid).text),
+                                         "carne": "2021104568"})
+    sid2 = start(t, sql("SELECT course_id FROM sessions WHERE id = %s", (sid,))[0][0])
+    incognito = student(ANDROID_CHROME)
+    incognito.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(incognito, t, sid2).text),
+                                            "carne": "2021104568"})
+    alert = next(a for a in t.get(f"/session/{sid2}/state").json()["alerts"] if a["student"])
+    assert alert["decision"] == ""
+    assert t.post(f"/session/{sid2}/event/{alert['id']}/decide",
+                  data={"decision": "rechazado"}).status_code == 200
+    assert t.get(f"/session/{sid2}/state").json()["alerts"][0]["decision"] == "rechazado"
+    rows = list(csv.DictReader(io.StringIO(t.get(f"/session/{sid2}/export.csv").text.lstrip("\ufeff"))))
+    juan = next(r for r in rows if r["Carné"] == "2021104568")
+    assert juan["Estado"] == "Rechazado" and "rechazado por Prof. Rojas" in juan["Observación"]
+    assert sql("SELECT COUNT(*) FROM attendance WHERE session_id = %s", (sid2,))[0][0] == 1
+    other = teacher("otro@uni.edu")  # another professor cannot decide
+    assert other.post(f"/session/{sid2}/event/{alert['id']}/decide",
+                      data={"decision": "confirmado"}, follow_redirects=False).status_code in (303, 401)
+
+
+def test_known_phone_not_on_this_list_is_pending_not_refused():
+    """A phone already linked in another class is never sent away from this one."""
+    t = teacher()
+    other = create_course(t, name="Otra", roster="Ana Gómez\t2021600001")
+    s = student()
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, start(t, other)).text),
+                                    "carne": "2021600001"})
+    sid = start(t, create_course(t, roster=ROSTER))
+    r = s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text)})
+    assert "Asistencia recibida" in r.text
+    assert sql("SELECT en.status FROM enrollments en JOIN sessions se ON se.course_id = en.course_id "
+               "JOIN students st ON st.id = en.student_id "
+               "WHERE se.id = %s AND st.carne = '2021600001'", (sid,))[0][0] == "pendiente"
+    labels = [a["label"] for a in t.get(f"/session/{sid}/state").json()["alerts"]]
+    assert main.EVENT_LABELS["carne_no_en_lista"] in labels
+
+
+def test_timing_is_kept_after_class_ends_and_export_is_anonymous():
+    t = teacher()
+    sid = start(t, create_course(t, roster=ROSTER))
+    s = student()
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text), "carne": "2021104567"})
+    t.post(f"/session/{sid}/end", follow_redirects=False)
+    age, accept, first = sql("SELECT qr_age_s, accept_s, first_link FROM attendance")[0]
+    assert 0 <= age <= main.NONCE_VALID_SECONDS and accept >= 0 and first is True
+    text = t.get(f"/session/{sid}/timing.csv").text
+    rows = list(csv.DictReader(io.StringIO(text)))
+    assert len(rows) == 1 and rows[0]["first_link"] == "1"
+    assert "2021104567" not in text and "María" not in text
+    assert student().get(f"/session/{sid}/timing.csv", follow_redirects=False).status_code == 303
+
+
+def test_brightspace_hash_prefix_is_ignored():
+    """Brightspace writes usernames and ids as "#agomez" and "#170001"."""
+    roster = ("OrgDefinedId\tUsername\tLast Name\tFirst Name\tEmail\n"
+              "#170001\t#agomez\tGOMEZ DIAZ\tANA\tagomez@uninorte.edu.co\n")
+    t = teacher()
+    sid = start(t, create_course(t, roster=roster))
+    assert sql("SELECT carne, username FROM students") == [("170001", "AGOMEZ")]
+    s = student()
+    r = s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text), "carne": "agomez"})
+    assert "Asistencia recibida" in r.text and "Ana Gomez Diaz" in r.text
+
+
+def test_nothing_is_stored_without_accepting_the_data_policy():
+    t = teacher()
+    sid = start(t, create_course(t, roster=""))
+    s = student()
+    tk = ticket_of(scan(s, t, sid).text)
+    r = s.post("/checkin/accept", data={"ticket": tk, "carne": "2021700001", "nombre": "Ana Ruiz"})
+    assert "acepta la política" in r.text and 'name="acepto"' in r.text
+    assert sql("SELECT COUNT(*) FROM students")[0][0] == 0
+    assert sql("SELECT COUNT(*) FROM attendance")[0][0] == 0
+    r = s.post("/checkin/accept", data={"acepto": "1", "ticket": tk, "carne": "2021700001",
+                                        "nombre": "Ana Ruiz"})
+    assert "Asistencia recibida" in r.text
+    assert sql("SELECT consent_at IS NOT NULL FROM students")[0][0] is True
+    assert "Ley 1581" in s.get("/privacidad").text
+
+
+def test_class_without_list_adds_a_known_phone_as_pending():
+    """Someone who linked a phone in another class just taps Aceptar here."""
+    t = teacher()
+    s = student()
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, start(t, create_course(t, roster=ROSTER))).text),
+                                    "carne": "2021104567"})
+    cid = create_course(t, name="Congreso", roster="")
+    r = s.post("/checkin/accept", data={"ticket": ticket_of(scan(s, t, start(t, cid)).text)})
+    assert "Asistencia recibida" in r.text and "María Fernanda Rojas" in r.text
+    assert sql("SELECT en.status FROM enrollments en WHERE en.course_id = %s", (cid,)) == [("pendiente",)]
+
+
+def test_a_typed_name_cannot_become_an_excel_formula():
+    t = teacher()
+    sid = start(t, create_course(t, roster=""))
+    s = student()
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text),
+                                    "carne": "2021800001", "nombre": '=HYPERLINK("http://x.co","ver")'})
+    rows = list(csv.reader(io.StringIO(t.get(f"/session/{sid}/export.csv").content.decode("utf-8-sig"))))
+    assert rows[1][1].startswith("'=")
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(t.get(f"/session/{sid}/export.xlsx").content))
+    assert wb.active.cell(row=2, column=2).data_type == "s"
+
+
+def test_banner_export_with_groups():
+    """Uninorte's Banner list: SPRIDEN_ID, SPRIDEN_LAST_NAME, SSBSECT_CRN (fictional rows)."""
+    import html as _html
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["SPRIDEN_ID", "SPRIDEN_LAST_NAME", "SSBSECT_CRN"])
+    ws.append([200100001, "ANA GOMEZ DIAZ", 3614])
+    ws.append([200100002, "LUIS PEREZ ROA", 3614])
+    ws.append([200100003, "EVA MARIN SOTO", 3615])
+    buf = io.BytesIO(); wb.save(buf)
+    t = teacher()
+    r = t.post("/course/new", data={"name": "Sistema Nervioso"},
+               files={"roster_file": ("Listado.xlsx", buf.getvalue())})
+    assert "Grupo 3614" in r.text and "Grupo 3615" in r.text
+    payload = _html.unescape(re.search(r'name="payload" value="([^"]+)"', r.text).group(1))
+    r = t.post("/course/new/groups", follow_redirects=False,
+               data={"name": "Sistema Nervioso", "payload": payload, "sections": ["3614", "3615"]})
+    assert sorted(x[0] for x in sql("SELECT name FROM students")) == ["Ana Gomez Diaz", "Eva Marin Soto",
+                                                                     "Luis Perez Roa"]
+    assert sorted(x[0] for x in sql("SELECT section FROM enrollments")) == ["3614", "3614", "3615"]
+    cid = int(re.search(r"/course/(\d+)", r.headers["location"]).group(1))
+    sid = int(re.search(r"/session/(\d+)/live", t.post(f"/course/{cid}/start", follow_redirects=False,
+              data={"chosen": "1", "sections": ["3614"]}).headers["location"]).group(1))
+    s = student()
+    r = s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text),
+                                        "carne": "200100001"})
+    assert "Asistencia recibida" in r.text and "Ana Gomez Diaz" in r.text
