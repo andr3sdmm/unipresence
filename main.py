@@ -76,6 +76,7 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
                                Response, StreamingResponse)
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 # ---------------------------------------------------------------
 # CONFIGURATION
@@ -133,17 +134,41 @@ def db():
     prepare_threshold=None turns off server-side prepared statements, which
     a transaction pooler cannot keep between transactions.
     """
-    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row,
-                           prepare_threshold=None)
-    try:
-        conn.execute(f"SET LOCAL search_path TO {SCHEMA}, public")
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    with get_pool().connection() as conn:
+        try:
+            conn.execute(f"SET LOCAL search_path TO {SCHEMA}, public")
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+_pool = None
+
+
+def get_pool() -> ConnectionPool:
+    """
+    A few connections kept open and reused.
+
+    Opening a connection to Neon means a network round trip and an encrypted
+    handshake, a noticeable fraction of a second. The live screen asks the
+    server something every 3 seconds and a new QR every 10, so paying that on
+    every request made the whole site feel slow. The pool pays it once.
+
+    Neon's free plan suspends the database after 5 minutes without use, which
+    drops open connections. `check` tests each connection before handing it
+    out and replaces a dead one, and `max_idle` closes connections idle for
+    4 minutes, before Neon would.
+    """
+    global _pool
+    if _pool is None:
+        _pool = ConnectionPool(
+            DATABASE_URL, min_size=1, max_size=5, max_idle=240, open=True,
+            check=ConnectionPool.check_connection,
+            kwargs={"row_factory": dict_row, "prepare_threshold": None},
+        )
+    return _pool
 
 
 SCHEMA_SQL = """
@@ -270,6 +295,27 @@ CREATE TABLE IF NOT EXISTS events (
 UPGRADE_SQL = """
 ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS section TEXT NOT NULL DEFAULT '';
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS sections TEXT[];
+-- Brightspace exports an internal number (OrgDefinedId) that students do not
+-- know. Their institutional username, the part of the email before the @,
+-- they do know. It is kept as a second way to find the same student.
+ALTER TABLE students ADD COLUMN IF NOT EXISTS username TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS students_username_key ON students (username);
+-- The professor's decision on each item under "Por revisar". The event is
+-- never deleted: the decision is written next to it.
+ALTER TABLE events ADD COLUMN IF NOT EXISTS decision TEXT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS decided_at TIMESTAMPTZ;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS decided_by TEXT;
+-- Timing of each QR check-in, for the relay analysis: how old the QR was
+-- when it was scanned, and how long the student took to tap Aceptar.
+-- Tickets are deleted when the class ends, so the numbers are copied to the
+-- attendance row, which is kept.
+ALTER TABLE scan_tickets ADD COLUMN IF NOT EXISTS qr_age_s REAL;
+ALTER TABLE attendance ADD COLUMN IF NOT EXISTS qr_age_s REAL;
+ALTER TABLE attendance ADD COLUMN IF NOT EXISTS accept_s REAL;
+ALTER TABLE attendance ADD COLUMN IF NOT EXISTS first_link BOOLEAN;
+-- When the person accepted the data policy (Law 1581 of 2012 asks for prior,
+-- informed authorization). Asked once, the first time a phone is linked.
+ALTER TABLE students ADD COLUMN IF NOT EXISTS consent_at TIMESTAMPTZ;
 """
 
 
@@ -388,9 +434,11 @@ EVENT_LABELS = {
     "cambio_dispositivo": "Su carné pasó a otro navegador o celular durante la clase",
     "rafaga": "Varias vinculaciones seguidas desde el mismo navegador y sistema",
     "desde_app": "Abrió el enlace dentro de una app",
-    "carne_no_en_lista": "Intentó marcar con un carné que no está en la lista",
+    "carne_no_en_lista": "Marcó con un carné o usuario que no está en la lista",
     "qr_vencido": "Escaneó un QR vencido",
     "manual": "Marcado a mano por el profesor",
+    "desvinculado": "El profesor desvinculó su celular",
+    "carne_corregido": "El profesor corrigió su carné o su nombre",
 }
 
 
@@ -531,8 +579,21 @@ def normalize_carne(value) -> str:
     """Excel turns 2021104567 into 2021104567.0 and likes leading apostrophes."""
     if isinstance(value, float) and value.is_integer():
         value = int(value)
-    text = str(value or "").strip().lstrip("'")
+    # Excel may add a leading apostrophe, and Brightspace exports write
+    # "#agomez" and "#170001" so that Excel keeps them as text.
+    text = str(value or "").strip().lstrip("'#")
+    # A student may type the whole email; only the part before @ is the key.
+    text = text.split("@")[0]
     return re.sub(r"\s+", "", text).upper()
+
+
+def find_student(conn, key: str):
+    """The same person can be found by carne or by institutional username."""
+    return conn.execute(
+        "SELECT * FROM students WHERE carne = %s OR username = %s "
+        "ORDER BY (username = %s) DESC NULLS LAST LIMIT 1",
+        (key, key, key),
+    ).fetchone()
 
 
 # ---------------------------------------------------------------
@@ -732,6 +793,32 @@ def student_page(body: str) -> str:
 # SIGN UP, LOG IN
 # ---------------------------------------------------------------
 
+PRIVACY_CONTACT = os.environ.get("PRIVACY_CONTACT", "al profesor que toma la asistencia")
+
+
+@app.get("/privacidad", response_class=HTMLResponse)
+def privacy_page():
+    """The data policy a person accepts the first time they link a phone."""
+    return student_page(f"""<div style="text-align:left">
+      <h1 style="font-size:22px">Política de tratamiento de datos</h1>
+      <p>UniPresence es un prototipo para registrar asistencia. Se usa con
+      autorización previa, según la Ley 1581 de 2012.</p>
+      <p><strong>Qué se guarda:</strong> tu carné, tu usuario institucional (lo que va
+      antes de @, nunca el correo completo) o la identificación que escribas; tu nombre;
+      la hora en que marcas; el navegador, el sistema del celular y si abriste el enlace
+      dentro de una app. Además, un código al azar en una cookie para reconocer este
+      navegador.</p>
+      <p><strong>Qué no se guarda:</strong> ubicación, fotos, datos biométricos ni el número
+      del celular.</p>
+      <p><strong>Para qué:</strong> solo para la asistencia de la clase o evento, y para
+      detectar si alguien marca por otra persona.</p>
+      <p><strong>Quién lo ve:</strong> solo el profesor u organizador de esa clase o evento.</p>
+      <p><strong>Tus derechos:</strong> conocer, actualizar, corregir o pedir que se borren tus
+      datos. Pídeselo {e(PRIVACY_CONTACT)}.</p>
+      <p class="hint">Si no aceptas, no se guarda nada y el profesor puede marcarte a mano.</p>
+    </div>""")
+
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
@@ -829,7 +916,7 @@ def logout(request: Request):
 # ---------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
-def home(request: Request):
+def home(request: Request, msg: str = ""):
     with db() as conn:
         teacher = require_teacher(request, conn)
         courses = conn.execute("""
@@ -864,10 +951,11 @@ def home(request: Request):
 
     empty = ("<div class='card'><p>Todavía no tienes clases. Crea la primera: "
              "con lista o sin lista, las dos funcionan.</p></div>")
+    flash = f"<div class='msg ok'>{e(msg)}</div>" if msg else ""
     return teacher_page("Mis clases", f"""
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
         <h1>Mis clases</h1><a class="btn" href="/course/new">Nueva clase</a>
-      </div>
+      </div>{flash}
       <div class="grid">{''.join(cards) or empty}</div>""", teacher)
 
 
@@ -901,7 +989,8 @@ def new_course_page(request: Request):
 
 def _sections(rows):
     counts = {}
-    for _, _, section in rows:
+    for r in rows:
+        section = r[2]
         if section:
             counts[section] = counts.get(section, 0) + 1
     return dict(sorted(counts.items()))
@@ -951,7 +1040,7 @@ def _picked(payload: str, sections: list[str]):
     except (ValueError, TypeError):
         return []
     chosen = set(sections)
-    return [r for r in rows if len(r) == 3 and r[2] in chosen]
+    return [r for r in rows if len(r) in (3, 4) and r[2] in chosen]
 
 
 def _create_course(conn, teacher, name, rows):
@@ -1016,7 +1105,8 @@ def course_page(course_id: int, request: Request, msg: str = ""):
             f"<button class='btn small' type='submit'>Aprobar</button></form> "
             f"<form class='inline' method='post' action='/course/{course_id}/remove'>"
             f"<input type='hidden' name='student_id' value='{s['id']}'>"
-            f"<button class='btn small grey' type='submit'>Quitar</button></form></td></tr>"
+            f"<button class='btn small grey' type='submit'>Quitar</button></form> "
+            f"<a href='/course/{course_id}/student/{s['id']}/edit'>Corregir</a></td></tr>"
             for s in pending)
         pending_html = f"""
           <h2>Por aprobar ({len(pending)})</h2>
@@ -1030,10 +1120,20 @@ def course_page(course_id: int, request: Request, msg: str = ""):
     approved = [s for s in students if s["status"] == "aprobado"]
     linked_yes = "<span class='pill ok'>sí</span>"
     linked_no = "<span class='muted'>todavía no</span>"
+    def unlink_button(st):
+        if not st["linked"]:
+            return ""
+        return (f" <form class='inline' method='post' action='/course/{course_id}/unlink' "
+                f"onsubmit=\"return confirm('¿Desvincular el celular de {e(st['name'])}? "
+                f"La próxima vez tendrá que escribir su carné.')\">"
+                f"<input type='hidden' name='student_id' value='{st['id']}'>"
+                f"<button class='btn small grey' type='submit'>Desvincular</button></form>")
+
     roster_rows = "".join(
         f"<tr><td>{e(s['name'])}</td><td>{e(s['carne'])}</td>"
         f"<td>{e(short_section(s['section'])) if s['section'] else ''}</td>"
-        f"<td>{linked_yes if s['linked'] else linked_no}</td></tr>"
+        f"<td>{linked_yes if s['linked'] else linked_no}{unlink_button(s)}</td>"
+        f"<td><a href='/course/{course_id}/student/{s['id']}/edit'>Corregir</a></td></tr>"
         for s in approved)
 
     live_pill = "<span class='pill ok'>en curso</span>"
@@ -1054,8 +1154,8 @@ def course_page(course_id: int, request: Request, msg: str = ""):
       {pending_html}
       <h2>Lista ({len(approved)})</h2>
       <div class="table-wrap"><table>
-        <tr><th>Nombre</th><th>Carné</th><th>Grupo</th><th>Celular vinculado</th></tr>
-        {roster_rows or "<tr><td colspan=4 class=muted>Sin estudiantes todavía.</td></tr>"}
+        <tr><th>Nombre</th><th>Carné</th><th>Grupo</th><th>Celular vinculado</th><th></th></tr>
+        {roster_rows or "<tr><td colspan=5 class=muted>Sin estudiantes todavía.</td></tr>"}
       </table></div>
       <details style="margin-top:12px"><summary>Agregar o actualizar la lista</summary>
         <div class="card" style="margin-top:10px">
@@ -1072,7 +1172,8 @@ def course_page(course_id: int, request: Request, msg: str = ""):
       <div class="table-wrap"><table>
         <tr><th>Sesión</th><th>Inicio</th><th>Fin</th><th>Presentes</th><th></th></tr>
         {session_rows or "<tr><td colspan=5 class=muted>Todavía no hay sesiones.</td></tr>"}
-      </table></div>""", teacher)
+      </table></div>
+      <p style="margin-top:40px"><a href="/course/{course_id}/delete" style="color:var(--bad)">Borrar esta clase</a></p>""", teacher)
 
 
 @app.post("/course/{course_id}/roster")
@@ -1102,6 +1203,174 @@ def update_roster_groups(course_id: int, request: Request, payload: str = Form(.
         added = save_roster(conn, course_id, rows) if rows else 0
     note = f"Lista guardada: {added} estudiantes." if added else "No marcaste ningún grupo."
     return RedirectResponse(f"/course/{course_id}?msg={note}", status_code=303)
+
+
+@app.get("/course/{course_id}/delete", response_class=HTMLResponse)
+def delete_course_page(course_id: int, request: Request, error: str = ""):
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        course = own_course(conn, teacher, course_id)
+        counts = conn.execute("""
+            SELECT (SELECT COUNT(*) FROM enrollments WHERE course_id = %s) AS students,
+                   (SELECT COUNT(*) FROM sessions WHERE course_id = %s) AS sessions
+        """, (course_id, course_id)).fetchone()
+    msg = "<div class='msg bad'>El nombre no coincide. No se borró nada.</div>" if error else ""
+    return teacher_page("Borrar clase", f"""
+      <h1>Borrar “{e(course['name'])}”</h1>{msg}
+      <div class="card" style="max-width:560px">
+        <p>Se borran la lista ({counts['students']} estudiantes), las {counts['sessions']} sesiones
+        y toda su asistencia. <strong>No se puede deshacer.</strong> Si necesitas los reportes,
+        descárgalos antes.</p>
+        <form method="post" action="/course/{course_id}/delete">
+          <label for="confirm_name">Escribe el nombre de la clase para confirmar</label>
+          <input id="confirm_name" name="confirm_name" required autocomplete="off">
+          <p style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn red" type="submit">Borrar para siempre</button>
+            <a class="btn grey" href="/course/{course_id}">Cancelar</a></p>
+        </form>
+      </div>""", teacher)
+
+
+@app.post("/course/{course_id}/delete")
+def delete_course(course_id: int, request: Request, confirm_name: str = Form(...)):
+    """
+    Typing the class name is the confirmation: a misplaced tap cannot erase a
+    semester of attendance.
+
+    Students are shared between classes, so they are not deleted with the
+    class. Only the ones left with no class and no attendance anywhere go,
+    which removes test carnes without touching a student someone else teaches.
+    """
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        course = own_course(conn, teacher, course_id)
+        if confirm_name.strip().casefold() != course["name"].strip().casefold():
+            return RedirectResponse(f"/course/{course_id}/delete?error=1", status_code=303)
+        conn.execute("DELETE FROM courses WHERE id = %s", (course_id,))
+        conn.execute("""
+            DELETE FROM students st
+            WHERE NOT EXISTS (SELECT 1 FROM enrollments en WHERE en.student_id = st.id)
+              AND NOT EXISTS (SELECT 1 FROM attendance a WHERE a.student_id = st.id)
+        """)
+    return RedirectResponse(f"/?msg=Clase “{course['name']}” borrada.", status_code=303)
+
+
+def class_student(conn, course_id, student_id):
+    return conn.execute(
+        "SELECT st.* FROM students st JOIN enrollments en ON en.student_id = st.id "
+        "WHERE st.id = %s AND en.course_id = %s", (student_id, course_id)).fetchone()
+
+
+@app.get("/course/{course_id}/student/{student_id}/edit", response_class=HTMLResponse)
+def edit_student_page(course_id: int, student_id: int, request: Request, error: str = ""):
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        own_course(conn, teacher, course_id)
+        st = class_student(conn, course_id, student_id)
+        if not st:
+            return RedirectResponse(f"/course/{course_id}", status_code=303)
+    msg = f"<div class='msg bad'>{e(error)}</div>" if error else ""
+    return teacher_page("Corregir estudiante", f"""
+      <h1>Corregir estudiante</h1>{msg}
+      <div class="card" style="max-width:520px">
+        <form method="post" action="/course/{course_id}/student/{student_id}/edit">
+          <label for="carne">Carné</label>
+          <input id="carne" name="carne" value="{e(st['carne'])}" required autocapitalize="characters">
+          <label for="name">Nombre</label>
+          <input id="name" name="name" value="{e(st['name'])}" required maxlength="80">
+          <p class="hint">Su celular sigue vinculado y su asistencia se conserva. Si el carné
+          correcto ya existe (por ejemplo, porque está en la lista), los dos registros se unen.</p>
+          <p style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn" type="submit">Guardar</button>
+            <a class="btn grey" href="/course/{course_id}">Cancelar</a></p>
+        </form>
+      </div>""", teacher)
+
+
+@app.post("/course/{course_id}/student/{student_id}/edit")
+def edit_student(course_id: int, student_id: int, request: Request,
+                 carne: str = Form(...), name: str = Form(...)):
+    """
+    A student who mistypes the carne in a class without a list cannot fix it
+    alone: from then on the browser marks for the wrong carne and ignores what
+    is typed. The professor corrects it here.
+
+    If the right carne already belongs to another record (the student is on
+    the list, or linked properly in another class), the two are merged:
+    attendance, classes and history move to the right record, and the
+    browser follows unless that record already has its own.
+    """
+    new_carne = normalize_carne(carne)
+    new_name = re.sub(r"\s+", " ", name).strip()[:80]
+    back = f"/course/{course_id}/student/{student_id}/edit"
+    if not new_carne or not new_name:
+        return RedirectResponse(f"{back}?error=Escribe el carné y el nombre.", status_code=303)
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        own_course(conn, teacher, course_id)
+        st = class_student(conn, course_id, student_id)
+        if not st:
+            return RedirectResponse(f"/course/{course_id}", status_code=303)
+        target = conn.execute("SELECT * FROM students WHERE carne = %s AND id <> %s",
+                              (new_carne, student_id)).fetchone()
+        if target is None:
+            conn.execute("UPDATE students SET carne = %s, name = %s WHERE id = %s",
+                         (new_carne, new_name, student_id))
+            keep, note = student_id, f"Datos de {new_name} corregidos."
+        else:
+            merge_students(conn, wrong=st, right=target)
+            keep, note = target["id"], f"{st['carne']} unido a {target['carne']} ({target['name']})."
+        log_event(conn, None, keep, "carne_corregido",
+                  f"{st['carne']} → {new_carne}, por {teacher['name']}")
+    return RedirectResponse(f"/course/{course_id}?msg={note}", status_code=303)
+
+
+def merge_students(conn, wrong, right):
+    """Move everything from the mistyped record to the right one, then drop it."""
+    w, r = wrong["id"], right["id"]
+    # Attendance: keep the right record's row where both marked the same class.
+    conn.execute("DELETE FROM attendance a WHERE a.student_id = %s AND EXISTS ("
+                 "SELECT 1 FROM attendance b WHERE b.student_id = %s "
+                 "AND b.session_id = a.session_id)", (w, r))
+    conn.execute("UPDATE attendance SET student_id = %s WHERE student_id = %s", (r, w))
+    # Classes: an approval on either side counts.
+    conn.execute("UPDATE enrollments e SET status = 'aprobado' WHERE e.student_id = %s "
+                 "AND EXISTS (SELECT 1 FROM enrollments f WHERE f.student_id = %s "
+                 "AND f.course_id = e.course_id AND f.status = 'aprobado')", (r, w))
+    conn.execute("DELETE FROM enrollments e WHERE e.student_id = %s AND EXISTS ("
+                 "SELECT 1 FROM enrollments f WHERE f.student_id = %s "
+                 "AND f.course_id = e.course_id)", (w, r))
+    conn.execute("UPDATE enrollments SET student_id = %s WHERE student_id = %s", (r, w))
+    conn.execute("UPDATE device_changes SET student_id = %s WHERE student_id = %s", (r, w))
+    conn.execute("UPDATE events SET student_id = %s WHERE student_id = %s", (r, w))
+    # The browser follows only if the right record has none of its own.
+    device = wrong["device_id"]
+    conn.execute("DELETE FROM students WHERE id = %s", (w,))
+    if device and not right["device_id"]:
+        conn.execute("UPDATE students SET device_id = %s, device_no = device_no + 1, "
+                     "registered_at = COALESCE(registered_at, now()) WHERE id = %s", (device, r))
+
+
+@app.post("/course/{course_id}/unlink")
+def unlink_device(course_id: int, request: Request, student_id: int = Form(...)):
+    """
+    For a stolen or replaced phone, or a carne linked by mistake during a test.
+    The student types the carne again on the next scan, and that first link
+    raises no "changed device" alert, because there is no device to change from.
+    Only a professor whose class includes the student can do it.
+    """
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        own_course(conn, teacher, course_id)
+        student = conn.execute(
+            "SELECT st.* FROM students st JOIN enrollments en ON en.student_id = st.id "
+            "WHERE st.id = %s AND en.course_id = %s", (student_id, course_id)).fetchone()
+        if not student:
+            return RedirectResponse(f"/course/{course_id}", status_code=303)
+        conn.execute("UPDATE students SET device_id = NULL WHERE id = %s", (student_id,))
+        log_event(conn, None, student_id, "desvinculado", f"por {teacher['name']}")
+    return RedirectResponse(f"/course/{course_id}?msg=Celular de {student['name']} desvinculado.",
+                            status_code=303)
 
 
 @app.post("/course/{course_id}/approve")
@@ -1141,19 +1410,26 @@ def _plain(text: str) -> str:
     return text.strip().lower()
 
 
-# Column names seen in the wild. Brightspace (Uninorte's platform) exports
+# Column names seen in the wild. Banner, Uninorte's academic system, exports
+# "SPRIDEN_ID, SPRIDEN_LAST_NAME, SSBSECT_CRN": the student code, the full
+# name and the group (CRN). Brightspace (Uninorte's course platform) exports
 # "OrgDefinedId, Last Name, First Name, Email, Sections"; Spanish sheets use
 # "Código, Apellidos, Nombres"; a paste from anywhere may have no header at all.
 FULL_NAME_HEADERS = {"name", "full name", "estudiante", "alumno", "nombre completo",
-                     "apellidos y nombres", "nombres y apellidos"}
+                     "apellidos y nombres", "nombres y apellidos", "spriden_last_name"}
 FIRST_NAME_HEADERS = {"first name", "nombre", "nombres", "primer nombre"}
 LAST_NAME_HEADERS = {"last name", "apellido", "apellidos"}
 CARNE_HEADERS = {"carne", "carnet", "codigo", "codigo estudiantil", "codigo de estudiante",
                  "id", "student id", "id estudiante", "orgdefinedid", "org defined id",
-                 "documento", "matricula", "cedula", "username", "usuario"}
-SECTION_HEADERS = {"sections", "section", "seccion", "secciones", "grupo", "nrc"}
-# Email is read past on purpose: the system has no use for it, and data it
-# does not keep cannot leak.
+                 "matricula", "spriden_id"}
+USERNAME_HEADERS = {"username", "usuario", "user name"}
+EMAIL_HEADERS = {"email", "correo", "correo electronico", "e-mail", "email address"}
+# "documento" and "cedula" were removed on purpose: a national ID number is
+# sensitive personal data and is never a good key for attendance.
+SECTION_HEADERS = {"sections", "section", "seccion", "secciones", "grupo", "nrc", "crn",
+                   "ssbsect_crn"}
+# From an email only the username before the @ is kept; the address itself
+# is never stored, and data the system does not keep cannot leak.
 
 
 def _looks_like_carne(cell: str) -> bool:
@@ -1170,7 +1446,7 @@ def _tidy_name(name: str) -> str:
 
 def parse_roster_rows(rows):
     """
-    Returns ([(carne, name, section), ...], [problems]).
+    Returns ([(carne, name, section, username), ...], [problems]).
 
     With headers, the columns are found by name; first and last name in
     separate columns are joined. Without headers, the cell that looks like an
@@ -1187,14 +1463,16 @@ def parse_roster_rows(rows):
 
     full_col, first_col, last_col = col(FULL_NAME_HEADERS), col(FIRST_NAME_HEADERS), col(LAST_NAME_HEADERS)
     carne_col, section_col = col(CARNE_HEADERS), col(SECTION_HEADERS)
+    user_col, email_col = col(USERNAME_HEADERS), col(EMAIL_HEADERS)
 
     result, problems, seen = [], [], set()
 
     def cell(r, i):
         return r[i] if i is not None and i < len(r) else ""
 
-    def add(carne, name, section, line):
-        carne = normalize_carne(carne)
+    def add(carne, name, section, line, username=""):
+        username = normalize_carne(username)
+        carne = normalize_carne(carne) or username
         name = _tidy_name(name)
         if not carne:
             problems.append(f"fila {line}: sin carné.")
@@ -1206,11 +1484,12 @@ def parse_roster_rows(rows):
             problems.append(f"fila {line}: carné {carne} repetido.")
             return
         seen.add(carne)
-        result.append((carne, name, section.strip()))
+        result.append((carne, name, section.strip(), username))
 
     has_name = full_col is not None or first_col is not None or last_col is not None
-    if has_name or carne_col is not None:
-        if not has_name or carne_col is None:
+    has_key = carne_col is not None or user_col is not None or email_col is not None
+    if has_name or has_key:
+        if not has_name or not has_key:
             missing = "nombre" if not has_name else "carné o código"
             return [], [f"La lista tiene encabezados pero falta la columna de {missing}."]
         for n, r in enumerate(rows[1:], start=2):
@@ -1218,7 +1497,8 @@ def parse_roster_rows(rows):
                 name = cell(r, full_col)
             else:
                 name = f"{cell(r, first_col)} {cell(r, last_col)}"
-            add(cell(r, carne_col), name, cell(r, section_col), n)
+            username = cell(r, user_col) or cell(r, email_col)
+            add(cell(r, carne_col), name, cell(r, section_col), n, username)
         return result, problems
 
     for n, r in enumerate(rows, start=1):
@@ -1273,10 +1553,12 @@ def save_roster(conn, course_id, rows) -> int:
     """
     for carne, name, *rest in rows:
         section = rest[0] if rest else ""
+        username = (rest[1] if len(rest) > 1 else "") or None
         student = conn.execute(
-            "INSERT INTO students (carne, name) VALUES (%s, %s) "
-            "ON CONFLICT (carne) DO UPDATE SET name = EXCLUDED.name RETURNING id",
-            (carne, name),
+            "INSERT INTO students (carne, name, username) VALUES (%s, %s, %s) "
+            "ON CONFLICT (carne) DO UPDATE SET name = EXCLUDED.name, "
+            "username = COALESCE(EXCLUDED.username, students.username) RETURNING id",
+            (carne, name, username),
         ).fetchone()
         conn.execute(
             "INSERT INTO enrollments (course_id, student_id, status, section) "
@@ -1415,7 +1697,20 @@ async function poll() {
 
   const alerts = document.getElementById('alerts'); alerts.innerHTML = '';
   if (!d.alerts.length) alerts.appendChild(el('span', 'Nada por ahora.', 'muted'));
-  d.alerts.forEach(a => alerts.appendChild(el('div', a.time + ' · ' + (a.name ? a.name + ' · ' : '') + a.label + (a.detail ? ' (' + a.detail + ')' : ''), 'alert')));
+  d.alerts.forEach(a => {
+    const box = el('div', a.time + ' · ' + (a.name ? a.name + ' · ' : '') + a.label + (a.detail ? ' (' + a.detail + ')' : ''), 'alert');
+    if (a.decision) {
+      box.appendChild(el('strong', ' · ' + a.decision));
+    } else if (a.student) {
+      [['confirmado', 'Confirmar'], ['rechazado', 'Rechazar']].forEach(([value, text]) => {
+        const b = el('button', text, 'btn small ' + (value === 'rechazado' ? 'red' : 'light'));
+        b.type = 'button'; b.style.marginLeft = '6px';
+        b.onclick = () => decide(a.id, value);
+        box.appendChild(b);
+      });
+    }
+    alerts.appendChild(box);
+  });
 
   const absent = document.getElementById('absent'); absent.innerHTML = '';
   if (!d.absent.length) absent.appendChild(el('span', d.total ? 'Nadie. Están todos.' : 'Sin lista: aparecerán al marcar.', 'muted'));
@@ -1428,6 +1723,12 @@ async function poll() {
 
   const recent = document.getElementById('recent'); recent.innerHTML = '';
   d.recent.forEach(s => recent.appendChild(el('div', s.time + ' · ' + s.name + (s.method === 'manual' ? ' (a mano)' : ''))));
+}
+
+async function decide(eventId, decision) {
+  const f = new FormData(); f.append('decision', decision);
+  await fetch('/session/' + SID + '/event/' + eventId + '/decide', { method: 'POST', body: f });
+  poll();
 }
 
 async function manual(fields, label) {
@@ -1505,8 +1806,9 @@ def live_state(session_id: int, request: Request):
         "absent": [{"id": a["id"], "name": a["name"], "carne": a["carne"]} for a in absent],
         "recent": [{"name": r["name"], "time": local_time(r["marked_at"]), "method": r["method"]}
                    for r in recent],
-        "alerts": [{"time": local_time(a["created_at"]), "name": a["name"] or "",
-                    "label": EVENT_LABELS.get(a["kind"], a["kind"]), "detail": a["detail"]}
+        "alerts": [{"id": a["id"], "time": local_time(a["created_at"]), "name": a["name"] or "",
+                    "label": EVENT_LABELS.get(a["kind"], a["kind"]), "detail": a["detail"],
+                    "student": a["student_id"] is not None, "decision": a["decision"] or ""}
                    for a in alerts],
     }
 
@@ -1535,7 +1837,7 @@ def manual_mark(session_id: int, request: Request, student_id: int = Form(0),
             carne = normalize_carne(carne)
             if not carne:
                 return {"message": "Escribe el carné."}
-            student = conn.execute("SELECT * FROM students WHERE carne = %s", (carne,)).fetchone()
+            student = find_student(conn, carne)
             if not student:
                 if not name.strip():
                     return {"message": "Ese carné es nuevo: escribe también el nombre."}
@@ -1552,6 +1854,25 @@ def manual_mark(session_id: int, request: Request, student_id: int = Form(0),
         if created:
             log_event(conn, session_id, student["id"], "manual", f"por {teacher['name']}")
     return {"message": f"{student['name']}: {'marcado a mano' if created else 'ya estaba marcado'}."}
+
+
+@app.post("/session/{session_id}/event/{event_id}/decide")
+def decide_event(session_id: int, event_id: int, request: Request, decision: str = Form(...)):
+    """
+    The professor checks the student in person and confirms or rejects.
+    A rejected check-in stays in the database and in the report, marked as
+    rejected: nothing is erased, so the decision itself can be audited.
+    """
+    if decision not in ("confirmado", "rechazado"):
+        return JSONResponse({"error": "decision"}, status_code=400)
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        own_session(conn, teacher, session_id)
+        conn.execute(
+            "UPDATE events SET decision = %s, decided_at = now(), decided_by = %s "
+            "WHERE id = %s AND session_id = %s AND review AND student_id IS NOT NULL",
+            (decision, teacher["name"], event_id, session_id))
+    return {"ok": True}
 
 
 @app.post("/session/{session_id}/end")
@@ -1618,7 +1939,7 @@ def rescan_page(reason="Ese QR ya venció."):
                         "Apunta la cámara al QR que está ahora en la pantalla.</p>")
 
 
-def accept_form(session, ticket, student=None, error=""):
+def accept_form(session, ticket, student=None, error="", ask_name=False, carne=""):
     msg = f"<div class='msg bad'>{e(error)}</div>" if error else ""
     head = (f"<div class='course'>{e(session['course_name'])}</div>"
             f"<p class='prof'>{e(session['teacher_name'])}</p>")
@@ -1630,17 +1951,24 @@ def accept_form(session, ticket, student=None, error=""):
             <input type="hidden" name="ticket" value="{e(ticket)}">
             <button class="btn big" type="submit">Aceptar</button>
           </form>""")
-    name_field = "" if session["has_roster"] else """
+    name_field = "" if session["has_roster"] and not ask_name else """
             <label for="nombre">Nombre completo</label>
             <input id="nombre" name="nombre" required maxlength="80" autocomplete="name">"""
     return student_page(f"""{head}{msg}
-      <p><strong>Primera vez en este celular.</strong> Escribe tu carné una sola vez;
-      las próximas clases solo tocarás Aceptar.</p>
+      <p><strong>Primera vez en este celular.</strong> Escribe tu carné o tu usuario
+      una sola vez; las próximas clases solo tocarás Aceptar.</p>
       <form method="post" action="/checkin/accept">
         <input type="hidden" name="ticket" value="{e(ticket)}">
-        <label for="carne">Carné</label>
-        <input id="carne" name="carne" required inputmode="text" autocapitalize="characters" autofocus>
+        <label for="carne">Carné o usuario</label>
+        <input id="carne" name="carne" required inputmode="text" autocapitalize="none"
+               autocomplete="off" value="{e(carne)}" autofocus>
+        <p class="hint">Tu usuario es lo que va antes de @ en tu correo de la universidad.</p>
         {name_field}
+        <label style="display:flex;gap:10px;align-items:flex-start;margin-top:16px;font-weight:normal">
+          <input type="checkbox" name="acepto" value="1" required style="width:auto;margin-top:4px">
+          <span>Acepto la <a href="/privacidad" target="_blank">política de tratamiento de datos</a>:
+          se guardan mi carné o usuario, mi nombre y la hora en que marco, solo para la asistencia.</span>
+        </label>
         <p style="margin-top:16px"><button class="btn big" type="submit">Aceptar</button></p>
       </form>
       <p class="hint">Usa siempre este mismo navegador para escanear.</p>""")
@@ -1709,8 +2037,11 @@ def checkin(request: Request, s: int, n: str):
                     page = receipt_page(session, student, existing, created=False)
                 else:
                     ticket = secrets.token_urlsafe(16)
-                    conn.execute("INSERT INTO scan_tickets (token, session_id) VALUES (%s, %s)",
-                                 (ticket, s))
+                    # Seconds since this QR was issued. A relayed QR (photo,
+                    # video call) arrives older than one scanned in the room.
+                    age = NONCE_VALID_SECONDS - (nonce["expires_at"] - utcnow()).total_seconds()
+                    conn.execute("INSERT INTO scan_tickets (token, session_id, qr_age_s) "
+                                 "VALUES (%s, %s, %s)", (ticket, s, round(age, 2)))
                     page = accept_form(session, ticket, student)
 
     response = HTMLResponse(page)
@@ -1721,7 +2052,7 @@ def checkin(request: Request, s: int, n: str):
 
 @app.post("/checkin/accept", response_class=HTMLResponse)
 def checkin_accept(request: Request, ticket: str = Form(...),
-                   carne: str = Form(""), nombre: str = Form("")):
+                   carne: str = Form(""), nombre: str = Form(""), acepto: str = Form("")):
     device_id = request.cookies.get("device_id")
     if not device_id:
         return student_page("<p class='bad-title'>Tu navegador no guardó la sesión</p>"
@@ -1742,22 +2073,42 @@ def checkin_accept(request: Request, ticket: str = Form(...),
 
         student = conn.execute("SELECT * FROM students WHERE device_id = %s",
                                (device_id,)).fetchone()
+        first_link = student is None
 
         if student is None:
             # First time in this browser: link it to the carne they type.
             carne = normalize_carne(carne)
             if not carne:
                 return accept_form(session, ticket, error="Escribe tu carné.")
-            student = conn.execute("SELECT * FROM students WHERE carne = %s",
-                                   (carne,)).fetchone()
+            if not acepto:
+                # Nothing about this person is stored without their consent.
+                return accept_form(session, ticket, carne=carne, ask_name=bool(nombre), error=(
+                    "Para continuar, acepta la política de tratamiento de datos."))
+            student = find_student(conn, carne)
 
             if session["has_roster"]:
                 if student is None or not enrollment(conn, course_id, student["id"]):
+                    # Version 1 locked 7 present students out. A student whose
+                    # carne or username is not on the list is not refused: the
+                    # first time they are asked to check it, the second time
+                    # they are marked as pending and the professor decides.
+                    nombre = re.sub(r"\s+", " ", nombre).strip()[:80]
+                    if not nombre:
+                        return accept_form(session, ticket, ask_name=True, carne=carne, error=(
+                            "No encontramos ese carné o usuario en la lista de esta clase. "
+                            "Revisa cómo lo escribiste. Si está bien, escribe también tu "
+                            "nombre y quedas marcado para que el profesor lo revise."))
                     log_event(conn, sid, student["id"] if student else None,
-                              "carne_no_en_lista", f"carné {carne} · {ua_text(ua)}", True, ua)
-                    return accept_form(session, ticket, error=(
-                        "Ese carné no está en la lista de esta clase. Revisa cómo lo "
-                        "escribiste; si está bien, avísale al profesor."))
+                              "carne_no_en_lista", f"{carne} · {ua_text(ua)}", True, ua)
+                    if student is None:
+                        conn.execute("INSERT INTO students (carne, name) VALUES (%s, %s) "
+                                     "ON CONFLICT (carne) DO NOTHING", (carne, nombre))
+                        student = conn.execute("SELECT * FROM students WHERE carne = %s",
+                                               (carne,)).fetchone()
+                    conn.execute(
+                        "INSERT INTO enrollments (course_id, student_id, status) "
+                        "VALUES (%s, %s, 'pendiente') ON CONFLICT DO NOTHING",
+                        (course_id, student["id"]))
             else:
                 if student is None:
                     nombre = re.sub(r"\s+", " ", nombre).strip()[:80]
@@ -1778,6 +2129,8 @@ def checkin_accept(request: Request, ticket: str = Form(...),
                                     "<p>Un navegador solo puede marcar por una persona.</p>")
             student = conn.execute("SELECT * FROM students WHERE id = %s",
                                    (student["id"],)).fetchone()
+            conn.execute("UPDATE students SET consent_at = COALESCE(consent_at, now()) "
+                         "WHERE id = %s", (student["id"],))
             log_event(conn, sid, student["id"], "vinculacion", ua_text(ua), False, ua)
             if status == "moved":
                 log_event(conn, sid, student["id"], "cambio_dispositivo",
@@ -1787,13 +2140,12 @@ def checkin_accept(request: Request, ticket: str = Form(...),
             # A browser the system knows. Whatever carne might be in the form
             # is ignored: this browser marks for its owner and nobody else.
             if not enrollment(conn, course_id, student["id"]):
+                # Same rule as for a new browser: a student who is not on the
+                # list is not sent away. The check-in is recorded as pending
+                # and flagged, and the professor decides.
                 if session["has_roster"]:
                     log_event(conn, sid, student["id"], "carne_no_en_lista",
-                              f"carné {student['carne']} · {ua_text(ua)}", True, ua)
-                    return student_page(
-                        f"<div class='course'>{e(session['course_name'])}</div>"
-                        f"<p class='bad-title'>No estás en la lista de esta clase</p>"
-                        f"<p>{e(student['name'])}, avísale al profesor para que te agregue.</p>")
+                              f"{student['carne']} · {ua_text(ua)}", True, ua)
                 conn.execute(
                     "INSERT INTO enrollments (course_id, student_id, status) "
                     "VALUES (%s, %s, 'pendiente') ON CONFLICT DO NOTHING",
@@ -1808,6 +2160,11 @@ def checkin_accept(request: Request, ticket: str = Form(...),
 
         att, created = record_attendance(conn, session, student, "qr", ua)
         conn.execute("UPDATE scan_tickets SET used_at = now() WHERE token = %s", (ticket,))
+        if created:
+            conn.execute(
+                "UPDATE attendance SET qr_age_s = %s, first_link = %s, "
+                "accept_s = EXTRACT(EPOCH FROM now() - %s::timestamptz) WHERE id = %s",
+                (t["qr_age_s"], first_link, t["scanned_at"], att["id"]))
         return receipt_page(session, student, att, created)
 
 
@@ -1835,11 +2192,17 @@ def build_report(conn, session, late_minutes: int):
     moved = {r["student_id"] for r in conn.execute(
         "SELECT DISTINCT student_id FROM device_changes WHERE session_id = %s",
         (session["id"],)).fetchall()}
+    rejected = {r["student_id"] for r in conn.execute(
+        "SELECT DISTINCT student_id FROM events WHERE session_id = %s "
+        "AND decision = 'rechazado'", (session["id"],)).fetchall()}
     notes = {}
     for ev in conn.execute(
             "SELECT * FROM events WHERE session_id = %s AND review AND student_id IS NOT NULL "
             "ORDER BY created_at", (session["id"],)).fetchall():
-        notes.setdefault(ev["student_id"], []).append(EVENT_LABELS.get(ev["kind"], ev["kind"]))
+        label = EVENT_LABELS.get(ev["kind"], ev["kind"])
+        if ev["decision"]:
+            label += f" ({ev['decision']} por {ev['decided_by']})"
+        notes.setdefault(ev["student_id"], []).append(label)
 
     rows = []
     for st in students:
@@ -1847,7 +2210,9 @@ def build_report(conn, session, late_minutes: int):
         minutes = None
         if a:
             minutes = int((a["marked_at"] - session["started_at"]).total_seconds() // 60)
-            if a["method"] == "manual":
+            if st["id"] in rejected:
+                state = "Rechazado"
+            elif a["method"] == "manual":
                 state = "Manual"
             elif minutes > late_minutes:
                 state = "Tarde"
@@ -1917,7 +2282,7 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
     body = "".join(
         "<tr>" + "".join(
             f"<td>{e(r[key])}</td>" if key != "estado" else
-            f"<td><span class='pill {'bad' if r[key] == 'Ausente' else 'warn' if r[key] in ('Tarde', 'Manual') else 'ok'}'>{e(r[key])}</span></td>"
+            f"<td><span class='pill {'bad' if r[key] in ('Ausente', 'Rechazado') else 'warn' if r[key] in ('Tarde', 'Manual') else 'ok'}'>{e(r[key])}</span></td>"
             for key, _ in REPORT_COLUMNS) + "</tr>"
         for r in rows)
     alert_items = "".join(
@@ -1951,6 +2316,7 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
         <button class="btn" type="button" onclick="window.print()">Imprimir o guardar PDF</button>
         <a class="btn light" href="/session/{session_id}/export.xlsx?tarde={tarde}">Descargar Excel</a>
         <a class="btn light" href="/session/{session_id}/export.csv?tarde={tarde}">Descargar CSV</a>
+        <a class="btn light" href="/session/{session_id}/timing.csv">Tiempos (anónimo)</a>
         {live_link}
         <a class="btn grey" href="/course/{session['course_id']}">Volver a la clase</a>
       </div>
@@ -1979,6 +2345,18 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
     """, teacher)
 
 
+def sheet_safe(value):
+    """
+    A name typed by a student, like =HYPERLINK("http://..."), would run as a
+    formula when the professor opens the report in Excel (CSV injection).
+    Text that starts with = + - or @ gets an apostrophe in front, so Excel
+    shows it as text. Numbers are left alone.
+    """
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@"):
+        return "'" + value
+    return value
+
+
 @app.get("/session/{session_id}/export.csv")
 def export_csv(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MINUTES):
     _, session, rows, _, _ = report_context(request, session_id, tarde)
@@ -1988,10 +2366,40 @@ def export_csv(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MINU
     writer = csv.writer(buffer)
     writer.writerow([label for _, label in REPORT_COLUMNS])
     for r in rows:
-        writer.writerow([r[key] for key, _ in REPORT_COLUMNS])
+        writer.writerow([sheet_safe(r[key]) for key, _ in REPORT_COLUMNS])
     data = ("﻿" + buffer.getvalue()).encode("utf-8")  # BOM: Excel reads the accents
     return Response(data, media_type="text/csv",
                     headers={"Content-Disposition": f"attachment; filename={file_name(session, 'csv')}"})
+
+
+TIMING_COLUMNS = ["n", "qr_age_s", "accept_s", "first_link", "browser", "os", "in_app"]
+
+
+@app.get("/session/{session_id}/timing.csv")
+def export_timing(session_id: int, request: Request):
+    """
+    One row per QR check-in, in the order they happened, with no name, carne
+    or receipt: only how old the QR was when scanned and how long the student
+    took to tap Aceptar. Anonymous by construction, so it can go straight into
+    the repository for the relay analysis.
+    """
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        session = own_session(conn, teacher, session_id)
+        rows = conn.execute(
+            "SELECT qr_age_s, accept_s, first_link, browser, os, in_app FROM attendance "
+            "WHERE session_id = %s AND method = 'qr' ORDER BY marked_at", (session_id,)).fetchall()
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(TIMING_COLUMNS)
+    for i, r in enumerate(rows, start=1):
+        writer.writerow([i, "" if r["qr_age_s"] is None else round(r["qr_age_s"], 2),
+                         "" if r["accept_s"] is None else round(float(r["accept_s"]), 2),
+                         "" if r["first_link"] is None else int(r["first_link"]),
+                         r["browser"] or "", r["os"] or "", r["in_app"] or ""])
+    return Response(buffer.getvalue().encode("utf-8"), media_type="text/csv",
+                    headers={"Content-Disposition":
+                             f"attachment; filename=tiempos_sesion_{session['id']}.csv"})
 
 
 @app.get("/session/{session_id}/export.xlsx")
@@ -2006,7 +2414,7 @@ def export_xlsx(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
     for cell in ws[1]:
         cell.font = Font(bold=True)
     for r in rows:
-        ws.append([r[key] for key, _ in REPORT_COLUMNS])
+        ws.append([sheet_safe(r[key]) for key, _ in REPORT_COLUMNS])
     widths = [14, 30, 12, 11, 10, 12, 9, 16, 10, 14, 12, 12, 16, 50]
     for i, w in enumerate(widths):
         ws.column_dimensions[openpyxl.utils.get_column_letter(i + 1)].width = w
