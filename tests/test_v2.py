@@ -707,3 +707,21 @@ def test_fix_groups_after_uploading_too_many():
     assert other.post(f"/session/{sid}/groups", data={"sections": []},
                       follow_redirects=False).status_code == 303
     assert sql("SELECT sections FROM sessions WHERE id = %s", (sid,))[0][0] == ["FUNDAMENTO MD2026303611"]
+
+
+def test_rename_class_sort_by_surname_and_burst_names_students():
+    t = teacher()
+    roster = ("OrgDefinedId,Last Name,First Name\n"
+              "170001,ZAPATA,ANA\n170002,ARIAS,LUIS\n170003,MEJIA,EVA\n")
+    cid = create_course(t, name="Prueba", roster=roster)
+    t.post(f"/course/{cid}/rename", data={"name": "Fundamentos"})
+    assert sql("SELECT name FROM courses WHERE id = %s", (cid,))[0][0] == "Fundamentos"
+    sid = start(t, cid)
+    for carne in ("170001", "170002", "170003"):
+        s = student()
+        s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text),
+                                        "carne": carne})
+    page = t.get(f"/session/{sid}/report").text
+    assert "data-apellido='arias luis arias'" in page and 'id="orden"' in page
+    assert "Ana Zapata" in sql("SELECT detail FROM events WHERE kind = 'rafaga'")[0][0]
+    assert "Varios estudiantes" in page
