@@ -774,3 +774,45 @@ def test_history_has_its_own_page_and_cards_link_both():
     assert f"/course/{cid}/historial" in home and "Ver lista" in home
     page = t.get(f"/course/{cid}/historial").text
     assert "Historial" in page and f"/session/{sid}/report" in page and "Tomar asistencia</button>" not in page
+
+
+def test_delete_one_test_session_and_the_data_it_created():
+    t = teacher()
+    cid = create_course(t, name="Fundamentos", roster=ROSTER)
+    real = start(t, cid)
+    s = student()
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, real).text),
+                                    "carne": "2021104567"})
+    t.post(f"/session/{real}/end", follow_redirects=False)
+    test = start(t, cid)
+    me = student(ANDROID_CHROME)
+    me.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(me, t, test).text),
+                                     "carne": "1045678901", "nombre": "Probador"})
+    t.post(f"/session/{test}/end", follow_redirects=False)
+    assert f"/session/{test}/delete" in t.get(f"/course/{cid}/historial").text
+    r = t.post(f"/session/{test}/delete", data={"confirm_id": "999"}, follow_redirects=False)
+    assert "error=1" in r.headers["location"]
+    t.post(f"/session/{test}/delete", data={"confirm_id": str(test)})
+    assert sql("SELECT COUNT(*) FROM sessions WHERE id = %s", (test,))[0][0] == 0
+    assert sql("SELECT COUNT(*) FROM students WHERE carne = '1045678901'")[0][0] == 0
+    assert sql("SELECT COUNT(*) FROM attendance WHERE session_id = %s", (real,))[0][0] == 1
+    assert sql("SELECT COUNT(*) FROM students WHERE carne = '2021104567'")[0][0] == 1
+    other = teacher("otro@uni.edu")
+    assert other.post(f"/session/{real}/delete", data={"confirm_id": str(real)},
+                      follow_redirects=False).status_code == 303
+    assert sql("SELECT COUNT(*) FROM sessions WHERE id = %s", (real,))[0][0] == 1
+
+
+def test_removing_a_student_from_their_only_class_deletes_their_data():
+    t = teacher()
+    cid = create_course(t, name="Prueba", roster="")
+    sid = start(t, cid)
+    s = student()
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text),
+                                    "carne": "1045678901", "nombre": "Probador"})
+    st = sql("SELECT id FROM students WHERE carne = '1045678901'")[0][0]
+    t.post(f"/course/{cid}/remove", data={"student_id": st})
+    assert sql("SELECT COUNT(*) FROM students WHERE id = %s", (st,))[0][0] == 1   # has attendance
+    t.post(f"/session/{sid}/end", follow_redirects=False)
+    t.post(f"/session/{sid}/delete", data={"confirm_id": str(sid)})
+    assert sql("SELECT COUNT(*) FROM students WHERE id = %s", (st,))[0][0] == 0
