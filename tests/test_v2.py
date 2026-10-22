@@ -725,3 +725,41 @@ def test_rename_class_sort_by_surname_and_burst_names_students():
     assert "data-apellido='arias luis arias'" in page and 'Apellido, Z a A' in page and "filterReport('Ausente'" in page
     assert "Ana Zapata" in sql("SELECT detail FROM events WHERE kind = 'rafaga'")[0][0]
     assert "Varios estudiantes" in page
+
+
+def test_second_list_with_other_codes_updates_instead_of_duplicating():
+    """Brightspace list first (6-digit ids), Banner list later (9-digit codes)."""
+    t = teacher()
+    cid = create_course(t, roster="OrgDefinedId,Last Name,First Name,Email\n"
+                                   "430465,VERGARA ROMERO,CARLOS,cvergara@u.edu\n"
+                                   "431830,MORA VIDAL,SOFIA,smora@u.edu\n")
+    sid = start(t, cid)
+    s = student()
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text),
+                                    "carne": "smora"})
+    t.post(f"/course/{cid}/roster", data={"roster_text": "SPRIDEN_ID\tSPRIDEN_LAST_NAME\n"
+                                          "200300001\tVERGARA ROMERO CARLOS\n"
+                                          "200300002\tMORA VIDAL SOFIA\n"})
+    assert sorted(r[0] for r in sql("SELECT carne FROM students")) == ["200300001", "200300002"]
+    assert sql("SELECT COUNT(*) FROM attendance")[0][0] == 1
+    assert sql("SELECT username FROM students WHERE carne = '200300002'")[0][0] == "SMORA"
+
+
+def test_groups_are_chosen_on_the_class_page_and_removal_is_tucked_away():
+    t = teacher()
+    roster = ("OrgDefinedId,Last Name,First Name,Sections\n"
+              "1,ROJAS,ANA,MAT2026303614\n2,DIAZ,LUIS,MAT2026303615\n")
+    r = t.post("/course/new", data={"name": "Mat", "roster_text": roster})
+    import html as _html
+    payload = _html.unescape(re.search(r'name="payload" value="([^"]+)"', r.text).group(1))
+    r = t.post("/course/new/groups", follow_redirects=False,
+               data={"name": "Mat", "payload": payload, "sections": ["MAT2026303614", "MAT2026303615"]})
+    cid = int(re.search(r"/course/(\d+)", r.headers["location"]).group(1))
+    page = t.get(f"/course/{cid}").text
+    start_form = page.split('action="/course/%d/start"' % cid)[1].split("</form>")[0]
+    assert "name='sections'" in start_form and "name='chosen'" in start_form
+    assert "Quitar un grupo de esta clase" in page
+    # nothing checked: attendance starts with every group
+    r = t.post(f"/course/{cid}/start", data={"chosen": "1"}, follow_redirects=False)
+    sid = int(re.search(r"/session/(\d+)/live", r.headers["location"]).group(1))
+    assert t.get(f"/session/{sid}/state").json()["total"] == 2
