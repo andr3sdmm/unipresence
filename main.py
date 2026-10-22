@@ -1110,8 +1110,20 @@ def course_page(course_id: int, request: Request, msg: str = ""):
     for s_ in students:
         if s_["status"] == "aprobado" and s_["section"]:
             group_counts[s_["section"]] = group_counts.get(s_["section"], 0) + 1
-    groups_html = ""
+    groups_html, start_groups = "", ""
     if len(group_counts) > 1:
+        # Choosing today's groups happens here, next to the button, in one step.
+        # Nothing checked means every group, so a quick start never fails.
+        start_groups = (
+            "<input type='hidden' name='chosen' value='1'>"
+            "<p style='margin:0 0 6px'><strong>¿Qué grupos están hoy en el salón?</strong> "
+            "<span class='hint'>Si no marcas ninguno, se cuentan todos.</span></p>"
+            "<div style='display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px'>" + "".join(
+                f"<label style='font-weight:normal;display:flex;gap:6px;align-items:center;margin:0;"
+                f"padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:#fff'>"
+                f"<input type='checkbox' name='sections' value='{e(g)}' style='width:auto'>"
+                f"{e(short_section(g))} <span class='muted'>· {n}</span></label>"
+                for g, n in sorted(group_counts.items())) + "</div>")
         items = "".join(
             f"<form class='inline' method='post' action='/course/{course_id}/groups/remove' "
             f"onsubmit=\"return confirm('¿Quitar {e(short_section(g))} de esta clase? "
@@ -1120,8 +1132,11 @@ def course_page(course_id: int, request: Request, msg: str = ""):
             f"<span class='pill ok'>{e(short_section(g))} · {n}</span> "
             f"<button class='btn small grey' type='submit'>Quitar</button></form>"
             for g, n in sorted(group_counts.items()))
-        groups_html = (f"<p class='hint'>Grupos en esta clase. Si subiste grupos que no son de esta "
-                       f"clase, quítalos aquí.</p><div style='display:flex;flex-wrap:wrap'>{items}</div>")
+        groups_html = (f"<details style='margin-top:12px'><summary>Quitar un grupo de esta clase</summary>"
+                       f"<div class='card' style='margin-top:10px'><p class='hint'>Solo si subiste un grupo "
+                       f"que no es de esta clase. Quitar no es para tomar asistencia: para eso marca los "
+                       f"grupos de hoy arriba, junto a “Tomar asistencia”. Los estudiantes que ya tienen "
+                       f"asistencia no se quitan.</p><div style='display:flex;flex-wrap:wrap'>{items}</div></div></details>")
     pending_html = ""
     validate_link = (f"<a class='btn small' href='/course/{course_id}/validar'>Validar con la lista</a>"
                      if pending and any(s["status"] == "aprobado" for s in students) else
@@ -1180,11 +1195,11 @@ def course_page(course_id: int, request: Request, msg: str = ""):
     flash = f"<div class='msg ok'>{e(msg)}</div>" if msg else ""
     return teacher_page(course["name"], f"""
       <h1>{e(course['name'])}</h1>{flash}
-      <form method="post" action="/course/{course_id}/start" style="max-width:420px">
-        <button class="btn big" type="submit">Tomar asistencia</button></form>
+      <form method="post" action="/course/{course_id}/start" style="max-width:640px">
+        {start_groups}
+        <button class="btn big" type="submit" style="max-width:420px">Tomar asistencia</button></form>
       {pending_html}
       <h2>Lista ({len(approved)})</h2>
-      {groups_html}
       <div class="table-wrap"><table>
         <tr><th>Nombre</th><th>Carné</th><th>Grupo</th><th>Celular vinculado</th><th></th></tr>
         {roster_rows or "<tr><td colspan=5 class=muted>Sin estudiantes todavía.</td></tr>"}
@@ -1200,6 +1215,7 @@ def course_page(course_id: int, request: Request, msg: str = ""):
           </form>
         </div>
       </details>
+      {groups_html}
       <h2>Historial</h2>
       <div class="table-wrap"><table>
         <tr><th>Sesión</th><th>Inicio</th><th>Fin</th><th>Presentes</th><th></th></tr>
@@ -1728,6 +1744,10 @@ def save_roster(conn, course_id, rows) -> int:
     own name differently when checking in, the list's spelling wins, and
     anyone on the list who was waiting for approval becomes approved.
     """
+    listed_codes = {r[0] for r in rows}
+    in_class = conn.execute(
+        "SELECT st.* FROM students st JOIN enrollments en ON en.student_id = st.id "
+        "WHERE en.course_id = %s AND en.status = 'aprobado'", (course_id,)).fetchall()
     for carne, name, *rest in rows:
         section = rest[0] if rest else ""
         username = (rest[1] if len(rest) > 1 else "") or None
@@ -1737,6 +1757,22 @@ def save_roster(conn, course_id, rows) -> int:
         existing = conn.execute(
             "SELECT id FROM students WHERE carne = %s OR (%s::text IS NOT NULL AND username = %s) "
             "ORDER BY (carne = %s) DESC LIMIT 1", (carne, username, username, carne)).fetchone()
+        if not existing:
+            # A second list for the same class may use another code: Brightspace
+            # gives an internal 6-digit id, Banner the 9-digit student code.
+            # The same person is found by name, among students already listed
+            # in this class (never a pending one: those the professor confirms),
+            # when exactly one fits and their current code is not on this list.
+            # Their attendance stays; the code becomes the new one.
+            t = name_tokens(name)
+            same = [st for st in in_class if st["carne"] not in listed_codes and t and
+                    (t <= name_tokens(st["name"]) or name_tokens(st["name"]) <= t)]
+            if len(same) == 1:
+                existing = same[0]
+                log_event(conn, None, existing["id"], "carne_corregido",
+                          f"{existing['carne']} → {carne} (lista nueva)")
+                conn.execute("UPDATE students SET carne = %s WHERE id = %s", (carne, existing["id"]))
+                in_class = [st for st in in_class if st["id"] != existing["id"]]
         if existing:
             student = conn.execute(
                 "UPDATE students SET name = %s, username = COALESCE(%s, username), "
