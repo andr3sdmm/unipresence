@@ -669,3 +669,41 @@ def test_attendance_without_list_is_validated_when_the_list_arrives():
     payload = _html.unescape(re.search(r'name="payload" value="([^"]+)"', r.text).group(1))
     t.post(f"/course/{cid}/roster/groups", data={"payload": payload, "sections": ["FUNDAMENTO MD2026303604"]})
     assert sql("SELECT COUNT(*) FROM students")[0][0] == before
+
+
+def test_fix_groups_after_uploading_too_many():
+    """Real case, 21 Oct 2026: every group was uploaded, but only one was in the room."""
+    import html as _html
+    t = teacher()
+    cid = create_course(t, name="Prueba", roster="")
+    sid = start(t, cid)
+    s = student()
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text),
+                                    "carne": "200100101", "nombre": "Camila Reyes Duarte"})
+    t.post(f"/session/{sid}/end", follow_redirects=False)
+    roster = ("OrgDefinedId,Last Name,First Name,Email,Sections\n"
+              "170001,REYES DUARTE,CAMILA,creyes@universidad.edu.co,FUNDAMENTO MD2026303611\n"
+              "170002,MORA VIDAL,SOFIA,smora@universidad.edu.co,FUNDAMENTO MD2026303611\n"
+              "170003,PAZ LEON,TOMAS,tpaz@universidad.edu.co,FUNDAMENTO MD2026303604\n"
+              "170004,RUIZ SOL,ANA,aruiz@universidad.edu.co,FUNDAMENTO MD2026303605\n")
+    r = t.post(f"/course/{cid}/roster", data={"roster_text": roster})
+    payload = _html.unescape(re.search(r'name="payload" value="([^"]+)"', r.text).group(1))
+    t.post(f"/course/{cid}/roster/groups", data={"payload": payload, "sections": [
+        "FUNDAMENTO MD2026303611", "FUNDAMENTO MD2026303604", "FUNDAMENTO MD2026303605"]})
+    pairs = re.findall(r"name='pair' value='(\d+:\d+)' checked", t.get(f"/course/{cid}/validar").text)
+    t.post(f"/course/{cid}/validar", data={"pair": pairs})
+    assert "1 de 4" in t.get(f"/session/{sid}/report").text          # the mistake
+
+    page = t.get(f"/session/{sid}/report").text
+    assert "¿Qué grupos estaban en esta sesión?" in page
+    t.post(f"/session/{sid}/groups", data={"sections": ["FUNDAMENTO MD2026303611"]})
+    assert "1 de 2" in t.get(f"/session/{sid}/report").text          # fixed for that session
+
+    t.post(f"/course/{cid}/groups/remove", data={"section": "FUNDAMENTO MD2026303604"})
+    t.post(f"/course/{cid}/groups/remove", data={"section": "FUNDAMENTO MD2026303605"})
+    assert sql("SELECT COUNT(*) FROM enrollments WHERE course_id = %s", (cid,))[0][0] == 2
+    assert sql("SELECT COUNT(*) FROM attendance WHERE session_id = %s", (sid,))[0][0] == 1
+    other = teacher("otro@uni.edu")
+    assert other.post(f"/session/{sid}/groups", data={"sections": []},
+                      follow_redirects=False).status_code == 303
+    assert sql("SELECT sections FROM sessions WHERE id = %s", (sid,))[0][0] == ["FUNDAMENTO MD2026303611"]
