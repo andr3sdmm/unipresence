@@ -2563,7 +2563,10 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
     return teacher_page(f"Reporte {session['course_name']}", f"""
       <style>
         .stats {{ display:flex; gap:10px; flex-wrap:wrap; margin:10px 0 18px; }}
-        .stat {{ background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 14px; }}
+        .stat {{ background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 14px;
+                 font:inherit; color:inherit; text-align:left; text-decoration:none; }}
+        button.stat, a.stat {{ cursor:pointer; }}
+        .stat.on {{ outline:2px solid var(--ok); }}
         .stat b {{ display:block; font-size:26px; }}
         .sign {{ margin-top:48px; display:flex; gap:40px; flex-wrap:wrap; }}
         .sign div {{ border-top:1px solid var(--ink); padding-top:6px; min-width:240px; }}
@@ -2587,12 +2590,12 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
       <p>Profesor: {e(teacher['name'])} · Inicio: {local(session['started_at'])} · Fin: {ended} · Sesión #{session_id}</p>
       {groups_line}
       <div class="stats">
-        <div class="stat"><b>{present} de {len(rows)}</b>asistieron</div>
-        <div class="stat"><b>{count('Ausente')}</b>ausentes</div>
-        <div class="stat"><b>{count('Tarde')}</b>llegaron después de {tarde} min</div>
-        <div class="stat"><b>{count('Manual')}</b>marcados a mano</div>
-        <div class="stat"><b>{len(alerts)}</b>por revisar</div>
-        <div class="stat"><b>{expired}</b>escaneos de QR vencido</div>
+        <button type="button" class="stat" onclick="filterReport('', this)"><b>{present} de {len(rows)}</b>asistieron · ver todos</button>
+        <button type="button" class="stat" onclick="filterReport('Ausente', this)"><b>{count('Ausente')}</b>ausentes</button>
+        <button type="button" class="stat" onclick="filterReport('Tarde', this)"><b>{count('Tarde')}</b>llegaron después de {tarde} min</button>
+        <button type="button" class="stat" onclick="filterReport('Manual', this)"><b>{count('Manual')}</b>marcados a mano</button>
+        <a class="stat" href="#por-revisar"><b>{len(alerts)}</b>por revisar</a>
+        <div class="stat" title="Alguien escaneó un QR viejo y la app le pidió escanear otra vez. No es de un estudiante en particular."><b>{expired}</b>escaneos de QR vencido</div>
       </div>
       <form class="noprint" method="get" style="display:flex;gap:8px;align-items:center;max-width:420px;margin-bottom:12px">
         <label for="tarde" style="margin:0;white-space:nowrap">Tarde después de</label>
@@ -2603,8 +2606,8 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
             onsubmit="return false">
         <label for="orden" style="margin:0;white-space:nowrap">Ordenar por</label>
         <select id="orden" onchange="sortReport(this.value)">
-          <option value="apellido">Apellido</option>
-          <option value="nombre">Nombre</option>
+          <option value="apellido">Apellido, A a Z</option>
+          <option value="apellido-desc">Apellido, Z a A</option>
           <option value="carne">Código</option>
           <option value="llegada">Llegada: primero en marcar</option>
           <option value="llegada-desc">Llegada: último en marcar</option>
@@ -2623,13 +2626,20 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
             if (!x) return 1; if (!y) return -1;     // absent students always last
             return desc ? y - x : x - y;
           }}
-          return x.localeCompare(y, 'es', {{numeric: true}});
+          return desc ? y.localeCompare(x, 'es', {{numeric: true}}) : x.localeCompare(y, 'es', {{numeric: true}});
         }});
         rows.forEach(r => table.appendChild(r));
       }}
+      function filterReport(state, tile) {{
+        document.querySelectorAll('.stat').forEach(t => t.classList.remove('on'));
+        if (state) tile.classList.add('on');
+        document.querySelectorAll('#report tr').forEach((r, i) => {{
+          if (i) r.style.display = (!state || r.dataset.estado === state) ? '' : 'none';
+        }});
+      }}
       sortReport('apellido');
       </script>
-      <h2>Por revisar</h2>
+      <h2 id="por-revisar">Por revisar</h2>
       {alerts_html}
       <p class="hint">Estas señales son pistas, no pruebas. Si algo no cuadra, pregúntale al estudiante.</p>
       <div class="sign"><div>Firma del profesor</div><div>Fecha</div></div>
