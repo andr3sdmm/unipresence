@@ -763,3 +763,14 @@ def test_groups_are_chosen_on_the_class_page_and_removal_is_tucked_away():
     r = t.post(f"/course/{cid}/start", data={"chosen": "1"}, follow_redirects=False)
     sid = int(re.search(r"/session/(\d+)/live", r.headers["location"]).group(1))
     assert t.get(f"/session/{sid}/state").json()["total"] == 2
+
+
+def test_history_has_its_own_page_and_cards_link_both():
+    t = teacher()
+    cid = create_course(t, name="Gen", roster=ROSTER)
+    sid = start(t, cid)
+    t.post(f"/session/{sid}/end", follow_redirects=False)
+    home = t.get("/").text
+    assert f"/course/{cid}/historial" in home and "Ver lista" in home
+    page = t.get(f"/course/{cid}/historial").text
+    assert "Historial" in page and f"/session/{sid}/report" in page and "Tomar asistencia</button>" not in page
