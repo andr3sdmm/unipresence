@@ -4,7 +4,7 @@ Privacy-preserving physical presence verification for large classrooms.
 
 ## The problem
 
-Some Medicine courses at Universidad del Norte have hundreds of students, while the university requires professors to record attendance. Calling students one by one can take a significant amount of class time, so in practice attendance may not always be recorded.
+Some Medicine courses at a university in Colombia have hundreds of students, while the university requires professors to record attendance. Calling students one by one can take a significant amount of class time, so in practice attendance may not always be recorded.
 
 The challenge is not simply digitizing an attendance list. It is verifying that a student is physically present in the classroom without collecting sensitive data such as their location.
 
@@ -48,7 +48,7 @@ The pilot also lost its stored data when the free Render instance went to sleep.
 
 - BLE-based proximity verification, which would provide stronger evidence that a device is physically inside the classroom
 - Protection against live relay attacks, such as someone sharing the current QR through a video call
-- Universidad del Norte institutional authentication for professors
+- The university's institutional authentication for professors
 
 Because BLE verification is not implemented, the prototype should not be treated as proof of physical presence under every attack scenario.
 
