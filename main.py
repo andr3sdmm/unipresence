@@ -1097,6 +1097,22 @@ def course_page(course_id: int, request: Request, msg: str = ""):
         """, (course_id,)).fetchall()
 
     pending = [s for s in students if s["status"] == "pendiente"]
+    group_counts = {}
+    for s_ in students:
+        if s_["status"] == "aprobado" and s_["section"]:
+            group_counts[s_["section"]] = group_counts.get(s_["section"], 0) + 1
+    groups_html = ""
+    if len(group_counts) > 1:
+        items = "".join(
+            f"<form class='inline' method='post' action='/course/{course_id}/groups/remove' "
+            f"onsubmit=\"return confirm('¿Quitar {e(short_section(g))} de esta clase? "
+            f"Los que ya tienen asistencia se quedan.')\" style='margin:0 8px 6px 0'>"
+            f"<input type='hidden' name='section' value='{e(g)}'>"
+            f"<span class='pill ok'>{e(short_section(g))} · {n}</span> "
+            f"<button class='btn small grey' type='submit'>Quitar</button></form>"
+            for g, n in sorted(group_counts.items()))
+        groups_html = (f"<p class='hint'>Grupos en esta clase. Si subiste grupos que no son de esta "
+                       f"clase, quítalos aquí.</p><div style='display:flex;flex-wrap:wrap'>{items}</div>")
     pending_html = ""
     validate_link = (f"<a class='btn small' href='/course/{course_id}/validar'>Validar con la lista</a>"
                      if pending and any(s["status"] == "aprobado" for s in students) else
@@ -1159,6 +1175,7 @@ def course_page(course_id: int, request: Request, msg: str = ""):
         <button class="btn big" type="submit">Tomar asistencia</button></form>
       {pending_html}
       <h2>Lista ({len(approved)})</h2>
+      {groups_html}
       <div class="table-wrap"><table>
         <tr><th>Nombre</th><th>Carné</th><th>Grupo</th><th>Celular vinculado</th><th></th></tr>
         {roster_rows or "<tr><td colspan=5 class=muted>Sin estudiantes todavía.</td></tr>"}
@@ -2026,6 +2043,43 @@ def decide_event(session_id: int, event_id: int, request: Request, decision: str
     return {"ok": True}
 
 
+@app.post("/session/{session_id}/groups")
+def set_session_groups(session_id: int, request: Request, sections: list[str] = Form(default=[])):
+    """Which groups were in the room, set after the fact. Nothing is deleted."""
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        session = own_session(conn, teacher, session_id)
+        valid = set(course_sections(conn, session["course_id"]))
+        chosen = [g for g in sections if g in valid]
+        conn.execute("UPDATE sessions SET sections = %s WHERE id = %s",
+                     (chosen or None, session_id))
+    return RedirectResponse(f"/session/{session_id}/report", status_code=303)
+
+
+@app.post("/course/{course_id}/groups/remove")
+def remove_group(course_id: int, request: Request, section: str = Form(...)):
+    """
+    A group uploaded by mistake leaves the class. Students of that group who
+    already have attendance in this class stay, so no attendance is lost.
+    """
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        own_course(conn, teacher, course_id)
+        gone = conn.execute("""
+            DELETE FROM enrollments en WHERE en.course_id = %s AND en.section = %s
+              AND NOT EXISTS (SELECT 1 FROM attendance a JOIN sessions s ON s.id = a.session_id
+                              WHERE s.course_id = %s AND a.student_id = en.student_id)
+            RETURNING en.student_id""", (course_id, section, course_id)).fetchall()
+        kept = conn.execute("SELECT COUNT(*) AS n FROM enrollments WHERE course_id = %s "
+                            "AND section = %s", (course_id, section)).fetchone()["n"]
+        conn.execute("UPDATE sessions SET sections = array_remove(sections, %s) "
+                     "WHERE course_id = %s AND sections IS NOT NULL", (section, course_id))
+    note = f"{short_section(section)}: {len(gone)} estudiantes quitados de la clase."
+    if kept:
+        note += f" {kept} se quedan porque ya tienen asistencia."
+    return RedirectResponse(f"/course/{course_id}?msg={note}", status_code=303)
+
+
 @app.post("/session/{session_id}/end")
 def end_session(session_id: int, request: Request):
     with db() as conn:
@@ -2442,6 +2496,27 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
         for a in alerts)
     groups_line = (f"<p>Grupos de esta sesión: {e(', '.join(short_section(g) for g in session['sections']))}</p>"
                    if session["sections"] else "")
+    with db() as conn:
+        course_groups = course_sections(conn, session["course_id"])
+    if len(course_groups) > 1:
+        # A session taken before the list existed has no groups, so the report
+        # would count every group of the list. The professor sets them here.
+        mine = set(session["sections"] or [])
+        boxes = "".join(
+            f"<label style='font-weight:normal;display:inline-flex;gap:6px;align-items:center;margin-right:14px'>"
+            f"<input type='checkbox' name='sections' value='{e(g)}' {'checked' if g in mine else ''} style='width:auto'>"
+            f"{e(short_section(g))} <span class='muted'>({n})</span></label>"
+            for g, n in course_groups.items())
+        groups_line += f"""
+      <details class="noprint" {'open' if not mine else ''} style="margin-bottom:12px">
+        <summary>¿Qué grupos estaban en esta sesión?</summary>
+        <form method="post" action="/session/{session_id}/groups" class="card" style="margin-top:8px">
+          <p class="hint">Si tomaste asistencia antes de subir la lista, marca aquí los grupos que
+          estaban en el salón. El reporte cuenta solo esos grupos; nadie que marcó asistencia se pierde.</p>
+          <div>{boxes}</div>
+          <p style="margin-top:10px"><button class="btn small" type="submit">Guardar grupos</button></p>
+        </form>
+      </details>"""
     alerts_html = (f"<ul>{alert_items}</ul>" if alert_items
                    else "<p class='muted'>Nada que revisar en esta clase.</p>")
     ended = local(session["ended_at"]) if session["ended_at"] else "en curso"
