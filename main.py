@@ -316,6 +316,9 @@ ALTER TABLE attendance ADD COLUMN IF NOT EXISTS first_link BOOLEAN;
 -- When the person accepted the data policy (Law 1581 of 2012 asks for prior,
 -- informed authorization). Asked once, the first time a phone is linked.
 ALTER TABLE students ADD COLUMN IF NOT EXISTS consent_at TIMESTAMPTZ;
+-- The surname when the list has it in its own column, so a report can be
+-- sorted by last name the way professors read a class list.
+ALTER TABLE students ADD COLUMN IF NOT EXISTS last_name TEXT;
 """
 
 
@@ -432,7 +435,7 @@ def ua_text(ua: dict) -> str:
 EVENT_LABELS = {
     "vinculacion": "Vinculó este celular durante la clase",
     "cambio_dispositivo": "Su carné pasó a otro navegador o celular durante la clase",
-    "rafaga": "Varias vinculaciones seguidas desde el mismo navegador y sistema",
+    "rafaga": "Varios celulares nuevos seguidos con el mismo navegador y sistema",
     "desde_app": "Abrió el enlace dentro de una app",
     "carne_no_en_lista": "Marcó con un carné o usuario que no está en la lista",
     "qr_vencido": "Escaneó un QR vencido",
@@ -477,9 +480,15 @@ def check_burst(conn, session_id, ua):
         (session_id, since, ua["browser"], ua["os"]),
     ).fetchone()
     if not already:
+        names = [r["name"] for r in conn.execute(
+            "SELECT st.name FROM events ev JOIN students st ON st.id = ev.student_id "
+            "WHERE ev.session_id = %s AND ev.kind = 'vinculacion' AND ev.created_at >= %s "
+            "AND ev.browser = %s AND ev.os = %s ORDER BY ev.created_at",
+            (session_id, since, ua["browser"], ua["os"])).fetchall()]
         log_event(conn, session_id, None, "rafaga",
-                  f"{n} celulares nuevos en menos de {BURST_WINDOW_SECONDS} s "
-                  f"con {ua['browser']} en {ua['os']}", True, ua)
+                  f"{n} celulares nuevos en menos de {BURST_WINDOW_SECONDS} s con "
+                  f"{ua['browser']} en {ua['os']}: {', '.join(names[:6])}. En la primera "
+                  f"clase es normal; revisa solo si no reconoces a alguien o no estaba", True, ua)
 
 
 # ---------------------------------------------------------------
@@ -1041,7 +1050,7 @@ def _picked(payload: str, sections: list[str]):
     except (ValueError, TypeError):
         return []
     chosen = set(sections)
-    return [r for r in rows if len(r) in (3, 4) and r[2] in chosen]
+    return [r for r in rows if len(r) in (3, 4, 5) and r[2] in chosen]
 
 
 def _create_course(conn, teacher, name, rows):
@@ -1196,7 +1205,14 @@ def course_page(course_id: int, request: Request, msg: str = ""):
         <tr><th>Sesión</th><th>Inicio</th><th>Fin</th><th>Presentes</th><th></th></tr>
         {session_rows or "<tr><td colspan=5 class=muted>Todavía no hay sesiones.</td></tr>"}
       </table></div>
-      <p style="margin-top:40px"><a href="/course/{course_id}/delete" style="color:var(--bad)">Borrar esta clase</a></p>""", teacher)
+      <details style="margin-top:40px"><summary>Cambiar el nombre de la clase</summary>
+        <form method="post" action="/course/{course_id}/rename" class="card" style="margin-top:10px;max-width:460px">
+          <label for="new_name">Nombre nuevo</label>
+          <input id="new_name" name="name" required maxlength="100" value="{e(course['name'])}">
+          <p style="margin-top:12px"><button class="btn small" type="submit">Guardar nombre</button></p>
+        </form>
+      </details>
+      <p style="margin-top:20px"><a href="/course/{course_id}/delete" style="color:var(--bad)">Borrar esta clase</a></p>""", teacher)
 
 
 @app.post("/course/{course_id}/roster")
@@ -1631,7 +1647,7 @@ def parse_roster_rows(rows):
     def cell(r, i):
         return r[i] if i is not None and i < len(r) else ""
 
-    def add(carne, name, section, line, username=""):
+    def add(carne, name, section, line, username="", last=""):
         username = normalize_carne(username)
         carne = normalize_carne(carne) or username
         name = _tidy_name(name)
@@ -1645,7 +1661,7 @@ def parse_roster_rows(rows):
             problems.append(f"fila {line}: carné {carne} repetido.")
             return
         seen.add(carne)
-        result.append((carne, name, section.strip(), username))
+        result.append((carne, name, section.strip(), username, _tidy_name(last) if last else ""))
 
     has_name = full_col is not None or first_col is not None or last_col is not None
     has_key = carne_col is not None or user_col is not None or email_col is not None
@@ -1659,7 +1675,7 @@ def parse_roster_rows(rows):
             else:
                 name = f"{cell(r, first_col)} {cell(r, last_col)}"
             username = cell(r, user_col) or cell(r, email_col)
-            add(cell(r, carne_col), name, cell(r, section_col), n, username)
+            add(cell(r, carne_col), name, cell(r, section_col), n, username, cell(r, last_col))
         return result, problems
 
     for n, r in enumerate(rows, start=1):
@@ -1715,6 +1731,7 @@ def save_roster(conn, course_id, rows) -> int:
     for carne, name, *rest in rows:
         section = rest[0] if rest else ""
         username = (rest[1] if len(rest) > 1 else "") or None
+        last = (rest[2] if len(rest) > 2 else "") or None
         # A student validated earlier may now carry the code they typed instead
         # of the list's internal number; the username still finds them.
         existing = conn.execute(
@@ -1722,12 +1739,13 @@ def save_roster(conn, course_id, rows) -> int:
             "ORDER BY (carne = %s) DESC LIMIT 1", (carne, username, username, carne)).fetchone()
         if existing:
             student = conn.execute(
-                "UPDATE students SET name = %s, username = COALESCE(%s, username) "
-                "WHERE id = %s RETURNING id", (name, username, existing["id"])).fetchone()
+                "UPDATE students SET name = %s, username = COALESCE(%s, username), "
+                "last_name = COALESCE(%s, last_name) WHERE id = %s RETURNING id",
+                (name, username, last, existing["id"])).fetchone()
         else:
             student = conn.execute(
-                "INSERT INTO students (carne, name, username) VALUES (%s, %s, %s) RETURNING id",
-                (carne, name, username)).fetchone()
+                "INSERT INTO students (carne, name, username, last_name) VALUES (%s, %s, %s, %s) "
+                "RETURNING id", (carne, name, username, last)).fetchone()
         conn.execute(
             "INSERT INTO enrollments (course_id, student_id, status, section) "
             "VALUES (%s, %s, 'aprobado', %s) "
@@ -2041,6 +2059,18 @@ def decide_event(session_id: int, event_id: int, request: Request, decision: str
             "WHERE id = %s AND session_id = %s AND review AND student_id IS NOT NULL",
             (decision, teacher["name"], event_id, session_id))
     return {"ok": True}
+
+
+@app.post("/course/{course_id}/rename")
+def rename_course(course_id: int, request: Request, name: str = Form(...)):
+    """A class created as "Prueba" can become "Fundamentos" without losing anything."""
+    new = re.sub(r"\s+", " ", name).strip()[:100]
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        own_course(conn, teacher, course_id)
+        if new:
+            conn.execute("UPDATE courses SET name = %s WHERE id = %s", (new, course_id))
+    return RedirectResponse(f"/course/{course_id}?msg=Nombre guardado.", status_code=303)
 
 
 @app.post("/session/{session_id}/groups")
@@ -2385,7 +2415,7 @@ def build_report(conn, session, late_minutes: int):
     """
     groups = session["sections"]
     students = conn.execute("""
-        SELECT st.id, st.carne, st.name, en.status, en.section FROM students st
+        SELECT st.id, st.carne, st.name, st.last_name, en.status, en.section FROM students st
         LEFT JOIN enrollments en ON en.student_id = st.id AND en.course_id = %s
         WHERE (en.course_id IS NOT NULL
                AND (%s::text[] IS NULL OR en.section = ANY(%s::text[])))
@@ -2444,6 +2474,8 @@ def build_report(conn, session, late_minutes: int):
             "cambio_dispositivo": "Sí" if st["id"] in moved else "No",
             "comprobante": a["receipt"] if a else "",
             "observacion": "; ".join(observation),
+            "_apellido": _plain(f"{st['last_name']} {st['name']}" if st["last_name"] else st["name"]),
+            "_llegada": a["marked_at"].timestamp() if a else None,
         })
     return rows
 
@@ -2484,14 +2516,18 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
     count = lambda state: sum(1 for r in rows if r["estado"] == state)
     present = count("Presente") + count("Tarde") + count("Manual")
     head = "".join(f"<th>{label}</th>" for _, label in REPORT_COLUMNS)
+    def sort_attrs(r):
+        arrival = "" if r["_llegada"] is None else f"{r['_llegada']:.3f}"
+        return (f" data-apellido='{e(r['_apellido'])}' data-nombre='{e(_plain(r['nombre']))}' "
+                f"data-carne='{e(r['carne'])}' data-llegada='{arrival}' data-estado='{e(r['estado'])}'")
     body = "".join(
-        "<tr>" + "".join(
+        f"<tr{sort_attrs(r)}>" + "".join(
             f"<td>{e(r[key])}</td>" if key != "estado" else
             f"<td><span class='pill {'bad' if r[key] in ('Ausente', 'Rechazado') else 'warn' if r[key] in ('Tarde', 'Manual') else 'ok'}'>{e(r[key])}</span></td>"
             for key, _ in REPORT_COLUMNS) + "</tr>"
         for r in rows)
     alert_items = "".join(
-        f"<li>{local_time(a['created_at'])} · {e(a['name'] or 'Sin estudiante')} · "
+        f"<li>{local_time(a['created_at'])} · {e(a['name'] or 'Varios estudiantes')} · "
         f"{e(EVENT_LABELS.get(a['kind'], a['kind']))}{' (' + e(a['detail']) + ')' if a['detail'] else ''}</li>"
         for a in alerts)
     groups_line = (f"<p>Grupos de esta sesión: {e(', '.join(short_section(g) for g in session['sections']))}</p>"
@@ -2563,7 +2599,36 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
         <input id="tarde" name="tarde" type="number" min="0" max="240" value="{tarde}" style="width:90px">
         <span>min</span><button class="btn small" type="submit">Aplicar</button>
       </form>
-      <div class="table-wrap"><table><tr>{head}</tr>{body}</table></div>
+      <form class="noprint" style="display:flex;gap:8px;align-items:center;max-width:460px;margin-bottom:10px"
+            onsubmit="return false">
+        <label for="orden" style="margin:0;white-space:nowrap">Ordenar por</label>
+        <select id="orden" onchange="sortReport(this.value)">
+          <option value="apellido">Apellido</option>
+          <option value="nombre">Nombre</option>
+          <option value="carne">Código</option>
+          <option value="llegada">Llegada: primero en marcar</option>
+          <option value="llegada-desc">Llegada: último en marcar</option>
+          <option value="estado">Estado</option>
+        </select>
+      </form>
+      <div class="table-wrap"><table id="report"><tr>{head}</tr>{body}</table></div>
+      <script>
+      function sortReport(by) {{
+        const desc = by.endsWith('-desc'); const key = by.replace('-desc', '');
+        const table = document.getElementById('report');
+        const rows = Array.from(table.querySelectorAll('tr')).slice(1);
+        rows.sort((a, b) => {{
+          let x = a.dataset[key] || '', y = b.dataset[key] || '';
+          if (key === 'llegada') {{
+            if (!x) return 1; if (!y) return -1;     // absent students always last
+            return desc ? y - x : x - y;
+          }}
+          return x.localeCompare(y, 'es', {{numeric: true}});
+        }});
+        rows.forEach(r => table.appendChild(r));
+      }}
+      sortReport('apellido');
+      </script>
       <h2>Por revisar</h2>
       {alerts_html}
       <p class="hint">Estas señales son pistas, no pruebas. Si algo no cuadra, pregúntale al estudiante.</p>
