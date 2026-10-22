@@ -439,6 +439,7 @@ EVENT_LABELS = {
     "manual": "Marcado a mano por el profesor",
     "desvinculado": "El profesor desvinculó su celular",
     "carne_corregido": "El profesor corrigió su carné o su nombre",
+    "validado_con_lista": "El profesor lo validó con la lista",
 }
 
 
@@ -867,7 +868,7 @@ def signup_page(error: str = ""):
           <label for="name">Nombre</label>
           <input id="name" name="name" required maxlength="80" placeholder="Prof. María Pérez">
           <label for="institution">Institución <span class="muted">(opcional)</span></label>
-          <input id="institution" name="institution" maxlength="120" placeholder="Universidad del Norte">
+          <input id="institution" name="institution" maxlength="120" placeholder="Universidad">
           <label for="email">Correo</label>
           <input id="email" name="email" type="email" required>
           <label for="password">Contraseña</label>
@@ -1097,6 +1098,10 @@ def course_page(course_id: int, request: Request, msg: str = ""):
 
     pending = [s for s in students if s["status"] == "pendiente"]
     pending_html = ""
+    validate_link = (f"<a class='btn small' href='/course/{course_id}/validar'>Validar con la lista</a>"
+                     if pending and any(s["status"] == "aprobado" for s in students) else
+                     "<span class='hint'>¿Tomaste asistencia sin lista? Sube la lista abajo, en "
+                     "“Agregar o actualizar la lista”, y la app los cruza.</span>")
     if pending:
         rows = "".join(
             f"<tr><td>{e(s['name'])}</td><td>{e(s['carne'])}</td><td>"
@@ -1111,9 +1116,10 @@ def course_page(course_id: int, request: Request, msg: str = ""):
         pending_html = f"""
           <h2>Por aprobar ({len(pending)})</h2>
           <p class="hint">Se unieron marcando asistencia. Aprueba a los que reconoces como tus estudiantes.</p>
-          <form method="post" action="/course/{course_id}/approve">
+          <form method="post" action="/course/{course_id}/approve" class="inline">
             <input type="hidden" name="all" value="1">
             <button class="btn light small" type="submit">Aprobar a todos</button></form>
+          {validate_link}
           <div class="table-wrap" style="margin-top:10px"><table>
             <tr><th>Nombre</th><th>Carné</th><th></th></tr>{rows}</table></div>"""
 
@@ -1187,9 +1193,12 @@ async def update_roster(course_id: int, request: Request, roster_text: str = For
             return section_picker(teacher, f"/course/{course_id}/roster/groups",
                                   course["name"], rows, problems)
         added = save_roster(conn, course_id, rows) if rows else 0
+        waiting = pending_count(conn, course_id)
     note = f"Lista guardada: {added} estudiantes." if rows else "No encontré estudiantes en lo que enviaste."
     if problems:
         note += " Revisa: " + " ".join(problems[:5])
+    if added and waiting:
+        return RedirectResponse(f"/course/{course_id}/validar?msg={note}", status_code=303)
     return RedirectResponse(f"/course/{course_id}?msg={note}", status_code=303)
 
 
@@ -1201,8 +1210,143 @@ def update_roster_groups(course_id: int, request: Request, payload: str = Form(.
         teacher = require_teacher(request, conn)
         own_course(conn, teacher, course_id)
         added = save_roster(conn, course_id, rows) if rows else 0
+        waiting = pending_count(conn, course_id)
     note = f"Lista guardada: {added} estudiantes." if added else "No marcaste ningún grupo."
+    if added and waiting:
+        return RedirectResponse(f"/course/{course_id}/validar?msg={note}", status_code=303)
     return RedirectResponse(f"/course/{course_id}?msg={note}", status_code=303)
+
+
+# ---------------------------------------------------------------
+# VALIDATING AN ATTENDANCE TAKEN WITHOUT A LIST
+#
+# A professor without the list can still take attendance: students type a
+# code and their name and wait as "pendiente". When the list arrives later,
+# each pending student is matched to a row of the list, and the professor
+# confirms. Found on 21 October 2026: students typed their 9-digit code or
+# their username, while the Brightspace list only had an internal number.
+# ---------------------------------------------------------------
+
+STOP_WORDS = {"de", "del", "la", "las", "los", "y"}
+
+
+def name_tokens(name: str) -> set:
+    return set(re.findall(r"[a-z]+", _plain(name))) - STOP_WORDS
+
+
+def pending_count(conn, course_id) -> int:
+    return conn.execute("SELECT COUNT(*) AS n FROM enrollments WHERE course_id = %s "
+                        "AND status = 'pendiente'", (course_id,)).fetchone()["n"]
+
+
+def suggest_matches(conn, course_id):
+    """
+    For each pending student, the list row that is most likely the same
+    person, and how sure:
+      exacto   the typed code or username is that row's carne or username
+      nombre   every word of one name is in the other, and only one row fits
+      parcial  shares at least two words and no other row shares as many
+    A name alone never validates anyone: the professor confirms every match.
+    """
+    rows = conn.execute(
+        "SELECT st.*, en.status, en.section FROM students st JOIN enrollments en "
+        "ON en.student_id = st.id WHERE en.course_id = %s", (course_id,)).fetchall()
+    listed = [r for r in rows if r["status"] == "aprobado"]
+    pending = sorted((r for r in rows if r["status"] == "pendiente"), key=lambda r: r["name"])
+    taken, out = set(), []
+    for p in pending:
+        key = normalize_carne(p["carne"])
+        match, how = None, ""
+        exact = [l for l in listed if key in (l["carne"], l["username"])]
+        if len(exact) == 1:
+            match, how = exact[0], "exacto"
+        else:
+            t = name_tokens(p["name"])
+            subset = [l for l in listed if t and (t <= name_tokens(l["name"]) or name_tokens(l["name"]) <= t)]
+            if len(subset) == 1:
+                match, how = subset[0], "nombre"
+            elif t:
+                scored = sorted(((len(t & name_tokens(l["name"])), l) for l in listed),
+                                key=lambda x: -x[0])
+                if scored and scored[0][0] >= 2 and (len(scored) == 1 or scored[1][0] < scored[0][0]):
+                    match, how = scored[0][1], "parcial"
+        if match and match["id"] in taken:
+            match, how = None, ""
+        if match:
+            taken.add(match["id"])
+        out.append((p, match, how))
+    return out
+
+
+@app.get("/course/{course_id}/validar", response_class=HTMLResponse)
+def validate_page(course_id: int, request: Request, msg: str = ""):
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        course = own_course(conn, teacher, course_id)
+        pairs = suggest_matches(conn, course_id)
+    label = {"exacto": ("ok", "Mismo código o usuario"), "nombre": ("ok", "Mismo nombre"),
+             "parcial": ("warn", "Nombre parecido: revisa")}
+    body = ""
+    for p, m, how in pairs:
+        if m:
+            cls, text = label[how]
+            body += (f"<tr><td><input type='checkbox' name='pair' value='{p['id']}:{m['id']}' "
+                     f"{'checked' if how != 'parcial' else ''} style='width:auto'></td>"
+                     f"<td>{e(p['name'])}<br><span class='muted'>{e(p['carne'])}</span></td>"
+                     f"<td>{e(m['name'])}<br><span class='muted'>{e(short_section(m['section']))}</span></td>"
+                     f"<td><span class='pill {cls}'>{text}</span></td></tr>")
+        else:
+            body += (f"<tr><td></td><td>{e(p['name'])}<br><span class='muted'>{e(p['carne'])}</span></td>"
+                     f"<td class='muted'>No está en la lista</td><td><span class='pill bad'>Sigue pendiente</span></td></tr>")
+    flash = f"<div class='msg ok'>{e(msg)}</div>" if msg else ""
+    found = sum(1 for _, m, _ in pairs if m)
+    return teacher_page("Validar con la lista", f"""
+      <h1>Validar “{e(course['name'])}” con la lista</h1>{flash}
+      <p>{len(pairs)} estudiantes marcaron asistencia sin estar en la lista; {found} tienen
+      una pareja en la lista. Revisa cada fila: al confirmar, su asistencia pasa al estudiante
+      de la lista, con el código que escribió y su celular.</p>
+      <form method="post" action="/course/{course_id}/validar">
+        <div class="table-wrap"><table>
+          <tr><th></th><th>Escribió al marcar</th><th>En la lista</th><th>Coincidencia</th></tr>
+          {body or "<tr><td colspan=4 class=muted>No hay pendientes.</td></tr>"}
+        </table></div>
+        <p style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn" type="submit">Confirmar los marcados</button>
+          <a class="btn grey" href="/course/{course_id}">Volver</a></p>
+      </form>""", teacher)
+
+
+@app.post("/course/{course_id}/validar")
+def validate_confirm(course_id: int, request: Request, pair: list[str] = Form(default=[])):
+    """
+    Merge each confirmed pending student into their list row. The list's name
+    wins; the code the student typed is kept as their carne when it is a
+    number they know (the list may only carry an internal id); the username
+    stays as a second way in. Nothing is guessed: only checked rows move.
+    """
+    done = 0
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        own_course(conn, teacher, course_id)
+        valid = {(p["id"], m["id"]) for p, m, _ in suggest_matches(conn, course_id) if m}
+        for item in pair:
+            try:
+                pid, lid = (int(x) for x in item.split(":"))
+            except ValueError:
+                continue
+            if (pid, lid) not in valid:
+                continue
+            p = conn.execute("SELECT * FROM students WHERE id = %s", (pid,)).fetchone()
+            l = conn.execute("SELECT * FROM students WHERE id = %s", (lid,)).fetchone()
+            typed = p["carne"]
+            merge_students(conn, wrong=p, right=l)
+            if typed.isdigit() and typed != l["carne"]:
+                conn.execute("UPDATE students SET carne = %s WHERE id = %s", (typed, lid))
+            log_event(conn, None, lid, "validado_con_lista",
+                      f"{typed} → {l['name']}, por {teacher['name']}")
+            done += 1
+    return RedirectResponse(f"/course/{course_id}?msg={done} estudiantes validados con la lista.",
+                            status_code=303)
 
 
 @app.get("/course/{course_id}/delete", response_class=HTMLResponse)
@@ -1410,9 +1554,9 @@ def _plain(text: str) -> str:
     return text.strip().lower()
 
 
-# Column names seen in the wild. Banner, Uninorte's academic system, exports
+# Column names seen in the wild. Banner, the university's academic system, exports
 # "SPRIDEN_ID, SPRIDEN_LAST_NAME, SSBSECT_CRN": the student code, the full
-# name and the group (CRN). Brightspace (Uninorte's course platform) exports
+# name and the group (CRN). Brightspace (its course platform) exports
 # "OrgDefinedId, Last Name, First Name, Email, Sections"; Spanish sheets use
 # "Código, Apellidos, Nombres"; a paste from anywhere may have no header at all.
 FULL_NAME_HEADERS = {"name", "full name", "estudiante", "alumno", "nombre completo",
@@ -1554,12 +1698,19 @@ def save_roster(conn, course_id, rows) -> int:
     for carne, name, *rest in rows:
         section = rest[0] if rest else ""
         username = (rest[1] if len(rest) > 1 else "") or None
-        student = conn.execute(
-            "INSERT INTO students (carne, name, username) VALUES (%s, %s, %s) "
-            "ON CONFLICT (carne) DO UPDATE SET name = EXCLUDED.name, "
-            "username = COALESCE(EXCLUDED.username, students.username) RETURNING id",
-            (carne, name, username),
-        ).fetchone()
+        # A student validated earlier may now carry the code they typed instead
+        # of the list's internal number; the username still finds them.
+        existing = conn.execute(
+            "SELECT id FROM students WHERE carne = %s OR (%s::text IS NOT NULL AND username = %s) "
+            "ORDER BY (carne = %s) DESC LIMIT 1", (carne, username, username, carne)).fetchone()
+        if existing:
+            student = conn.execute(
+                "UPDATE students SET name = %s, username = COALESCE(%s, username) "
+                "WHERE id = %s RETURNING id", (name, username, existing["id"])).fetchone()
+        else:
+            student = conn.execute(
+                "INSERT INTO students (carne, name, username) VALUES (%s, %s, %s) RETURNING id",
+                (carne, name, username)).fetchone()
         conn.execute(
             "INSERT INTO enrollments (course_id, student_id, status, section) "
             "VALUES (%s, %s, 'aprobado', %s) "
