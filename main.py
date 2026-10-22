@@ -956,7 +956,8 @@ def home(request: Request, msg: str = ""):
             <h2 style="margin-top:0">{e(c['name'])}</h2>
             <p class="muted">{c['students']} estudiantes · {list_note}{pending}</p>
             {action}
-            <p style="margin:12px 0 0"><a href="/course/{c['id']}">Ver lista e historial</a></p>
+            <p style="margin:12px 0 0;display:flex;gap:18px"><a href="/course/{c['id']}">Ver lista</a>
+              <a href="/course/{c['id']}/historial">Historial</a></p>
           </div>""")
 
     empty = ("<div class='card'><p>Todavía no tienes clases. Crea la primera: "
@@ -1089,8 +1090,14 @@ def create_course_groups(request: Request, name: str = Form(...), payload: str =
     return RedirectResponse(f"/course/{course['id']}?msg={note}", status_code=303)
 
 
+@app.get("/course/{course_id}/historial", response_class=HTMLResponse)
+def course_history(course_id: int, request: Request):
+    """The attendance already taken in a class, on its own page."""
+    return course_page(course_id, request, only_history=True)
+
+
 @app.get("/course/{course_id}", response_class=HTMLResponse)
-def course_page(course_id: int, request: Request, msg: str = ""):
+def course_page(course_id: int, request: Request, msg: str = "", only_history: bool = False):
     with db() as conn:
         teacher = require_teacher(request, conn)
         course = own_course(conn, teacher, course_id)
@@ -1193,6 +1200,14 @@ def course_page(course_id: int, request: Request, msg: str = ""):
                          f"<td>{ended}</td><td>{s['present']}</td><td>{links}</td></tr>")
 
     flash = f"<div class='msg ok'>{e(msg)}</div>" if msg else ""
+    if only_history:
+        return teacher_page(f"Historial · {course['name']}", f"""
+      <h1>{e(course['name'])} · Historial</h1>
+      <p><a href="/course/{course_id}">Ver lista y tomar asistencia</a></p>
+      <div class="table-wrap"><table>
+        <tr><th>Sesión</th><th>Inicio</th><th>Fin</th><th>Presentes</th><th></th></tr>
+        {session_rows or "<tr><td colspan=5 class=muted>Todavía no hay sesiones.</td></tr>"}
+      </table></div>""", teacher)
     return teacher_page(course["name"], f"""
       <h1>{e(course['name'])}</h1>{flash}
       <form method="post" action="/course/{course_id}/start" style="max-width:640px">
@@ -1216,7 +1231,7 @@ def course_page(course_id: int, request: Request, msg: str = ""):
         </div>
       </details>
       {groups_html}
-      <h2>Historial</h2>
+      <h2 id="historial">Historial</h2>
       <div class="table-wrap"><table>
         <tr><th>Sesión</th><th>Inicio</th><th>Fin</th><th>Presentes</th><th></th></tr>
         {session_rows or "<tr><td colspan=5 class=muted>Todavía no hay sesiones.</td></tr>"}
@@ -1820,19 +1835,18 @@ def start_session(course_id: int, request: Request, sections: list[str] = Form(d
         groups = course_sections(conn, course_id)
         if len(groups) > 1 and not chosen:
             boxes = "".join(
-                f"<label style='font-weight:normal;display:flex;gap:10px;align-items:center;"
-                f"padding:10px;border:1px solid var(--line);border-radius:8px;background:#fff'>"
+                f"<label style='font-weight:normal;display:flex;gap:6px;align-items:center;margin:0;"
+                f"padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:#fff'>"
                 f"<input type='checkbox' name='sections' value='{e(sec)}' style='width:auto'>"
-                f"<span><strong>{e(short_section(sec))}</strong> "
-                f"<span class='muted'>· {n} estudiantes</span></span></label>"
+                f"{e(short_section(sec))} <span class='muted'>· {n}</span></label>"
                 for sec, n in groups.items())
             return HTMLResponse(teacher_page("Grupos de hoy", f"""
               <h1>{e(course['name'])}</h1>
               <p style="font-size:18px">¿Qué grupos están en el salón ahora?</p>
               <form method="post" action="/course/{course_id}/start" style="max-width:520px">
                 <input type="hidden" name="chosen" value="1">
-                <div style="display:grid;gap:8px">{boxes}</div>
-                <p class="hint">Si no marcas ninguno, se cuentan todos los grupos.</p>
+                <p class="hint" style="margin-top:0">Si no marcas ninguno, se cuentan todos los grupos.</p>
+                <div style="display:flex;flex-wrap:wrap;gap:8px">{boxes}</div>
                 <p style="margin-top:14px"><button class="btn big" type="submit">Tomar asistencia</button></p>
               </form>""", teacher))
         picked = [sec for sec in sections if sec in groups] or None
