@@ -53,7 +53,7 @@ def sql(query, params=()):
 def teacher(email="prof@uni.edu", name="Prof. Rojas"):
     c = TestClient(main.app)
     r = c.post("/signup", data={"name": name, "email": email, "password": "clave-segura-1",
-                                "institution": "Universidad del Norte"}, follow_redirects=False)
+                                "institution": "Universidad"}, follow_redirects=False)
     assert r.status_code == 303
     return c
 
@@ -160,10 +160,10 @@ def test_carne_not_on_list_asks_for_name_then_goes_to_review():
 
 
 def test_brightspace_list_matches_the_username_students_know():
-    """Uninorte case, 19 Oct 2026: OrgDefinedId is a number students do not know."""
+    """Real case, 19 Oct 2026: OrgDefinedId is a number students do not know."""
     roster = ("OrgDefinedId,Last Name,First Name,Email\n"
-              "170001,GOMEZ DIAZ,ANA,agomez@uninorte.edu.co\n"
-              "170002,PEREZ ROA,LUIS,lperez@uninorte.edu.co\n")
+              "170001,GOMEZ DIAZ,ANA,agomez@universidad.edu.co\n"
+              "170002,PEREZ ROA,LUIS,lperez@universidad.edu.co\n")
     t = teacher()
     sid = start(t, create_course(t, roster=roster))
     assert sql("SELECT username FROM students ORDER BY carne") == [("AGOMEZ",), ("LPEREZ",)]
@@ -174,7 +174,7 @@ def test_brightspace_list_matches_the_username_students_know():
     assert "Asistencia recibida" in r.text and "Ana Gomez Diaz" in r.text
     luis = student(ANDROID_CHROME)
     r = luis.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(luis, t, sid).text),
-                                           "carne": "LPerez@uninorte.edu.co"})
+                                           "carne": "LPerez@universidad.edu.co"})
     assert "Luis Perez Roa" in r.text
     assert sql("SELECT COUNT(*) FROM events WHERE kind = 'carne_no_en_lista'")[0][0] == 0
 
@@ -338,7 +338,7 @@ def test_roster_from_excel_and_semicolon_csv():
 
 
 def test_brightspace_export_with_several_groups():
-    """The Uninorte grade export: OrgDefinedId, Last Name, First Name, Email, Sections."""
+    """The Brightspace grade export: OrgDefinedId, Last Name, First Name, Email, Sections."""
     import json
     import openpyxl
     wb = openpyxl.Workbook()
@@ -533,7 +533,7 @@ def test_timing_is_kept_after_class_ends_and_export_is_anonymous():
 def test_brightspace_hash_prefix_is_ignored():
     """Brightspace writes usernames and ids as "#agomez" and "#170001"."""
     roster = ("OrgDefinedId\tUsername\tLast Name\tFirst Name\tEmail\n"
-              "#170001\t#agomez\tGOMEZ DIAZ\tANA\tagomez@uninorte.edu.co\n")
+              "#170001\t#agomez\tGOMEZ DIAZ\tANA\tagomez@universidad.edu.co\n")
     t = teacher()
     sid = start(t, create_course(t, roster=roster))
     assert sql("SELECT carne, username FROM students") == [("170001", "AGOMEZ")]
@@ -584,7 +584,7 @@ def test_a_typed_name_cannot_become_an_excel_formula():
 
 
 def test_banner_export_with_groups():
-    """Uninorte's Banner list: SPRIDEN_ID, SPRIDEN_LAST_NAME, SSBSECT_CRN (fictional rows)."""
+    """A Banner class list: SPRIDEN_ID, SPRIDEN_LAST_NAME, SSBSECT_CRN (fictional rows)."""
     import html as _html
     import openpyxl
     wb = openpyxl.Workbook()
@@ -611,3 +611,61 @@ def test_banner_export_with_groups():
     r = s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text),
                                         "carne": "200100001"})
     assert "Asistencia recibida" in r.text and "Ana Gomez Diaz" in r.text
+
+
+def test_attendance_without_list_is_validated_when_the_list_arrives():
+    """Real case, 21 Oct 2026: attendance taken with no list, the Brightspace list uploaded after. Fictional names."""
+    import html as _html
+    t = teacher()
+    cid = create_course(t, name="Fundamentos", roster="")
+    sid = start(t, cid)
+    typed = [("200100101", "Camila Reyes Duarte", IPHONE),        # her code: matches by name
+             ("SMORA", "Sofia Mora Vidal", ANDROID_CHROME),  # her username: exact
+             ("200100103", "María Lucía Navarro", INSTAGRAM),  # only part of her name
+             ("200999999", "Persona Ajena", IPHONE)]              # not on the list
+    phones = {}
+    for carne, name, ua in typed:
+        s = student(ua)
+        s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text),
+                                        "carne": carne, "nombre": name})
+        phones[carne] = s
+    t.post(f"/session/{sid}/end", follow_redirects=False)
+
+    roster = ("OrgDefinedId,Last Name,First Name,Email,Sections\n"
+              "170001,REYES DUARTE,CAMILA,creyes@universidad.edu.co,FUNDAMENTO MD2026303604\n"
+              "170002,MORA VIDAL,SOFIA,smora@universidad.edu.co,FUNDAMENTO MD2026303604\n"
+              "170003,NAVARRO PEÑA,MARIA ANDREA,manavarro@universidad.edu.co,FUNDAMENTO MD2026303604\n"
+              "170004,OTRO,ALUMNO,otro@universidad.edu.co,FUNDAMENTO MD2026303605\n")
+    r = t.post(f"/course/{cid}/roster", data={"roster_text": roster})
+    payload = _html.unescape(re.search(r'name="payload" value="([^"]+)"', r.text).group(1))
+    r = t.post(f"/course/{cid}/roster/groups", follow_redirects=False,
+               data={"payload": payload, "sections": ["FUNDAMENTO MD2026303604"]})
+    assert "/validar" in r.headers["location"]
+
+    page = t.get(f"/course/{cid}/validar").text
+    assert "Mismo nombre" in page and "Mismo código o usuario" in page
+    assert "Nombre parecido" in page and "No está en la lista" in page
+    pairs = re.findall(r"name='pair' value='(\d+:\d+)' (checked)?", page)
+    assert sum(1 for _, c in pairs if c) == 2     # the partial match is not pre-checked
+    t.post(f"/course/{cid}/validar", data={"pair": [p for p, c in pairs if c]})
+
+    gil = sql("SELECT id, carne, name, username, device_id IS NOT NULL FROM students "
+              "WHERE username = 'CREYES'")[0]
+    assert gil[1:] == ("200100101", "Camila Reyes Duarte", "CREYES", True)  # her code kept, list's name
+    assert sql("SELECT COUNT(*) FROM attendance WHERE student_id = %s", (gil[0],))[0][0] == 1
+    assert sql("SELECT status FROM enrollments WHERE student_id = %s AND course_id = %s",
+               (gil[0], cid))[0][0] == "aprobado"
+    assert sql("SELECT carne FROM students WHERE username = 'SMORA'")[0][0] == "170002"
+    assert sql("SELECT COUNT(*) FROM enrollments WHERE course_id = %s AND status = 'pendiente'",
+               (cid,))[0][0] == 2
+    # Next class her phone is recognized as the listed student, one tap.
+    sid2 = start(t, cid)
+    r = phones["200100101"].post("/checkin/accept",
+                                 data={"ticket": ticket_of(scan(phones["200100101"], t, sid2).text)})
+    assert "Camila Reyes Duarte" in r.text
+    # Uploading the same list again creates no duplicates.
+    before = sql("SELECT COUNT(*) FROM students")[0][0]
+    r = t.post(f"/course/{cid}/roster", data={"roster_text": roster})
+    payload = _html.unescape(re.search(r'name="payload" value="([^"]+)"', r.text).group(1))
+    t.post(f"/course/{cid}/roster/groups", data={"payload": payload, "sections": ["FUNDAMENTO MD2026303604"]})
+    assert sql("SELECT COUNT(*) FROM students")[0][0] == before
