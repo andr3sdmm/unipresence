@@ -722,6 +722,6 @@ def test_rename_class_sort_by_surname_and_burst_names_students():
         s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text),
                                         "carne": carne})
     page = t.get(f"/session/{sid}/report").text
-    assert "data-apellido='arias luis arias'" in page and 'id="orden"' in page
+    assert "data-apellido='arias luis arias'" in page and 'Apellido, Z a A' in page and "filterReport('Ausente'" in page
     assert "Ana Zapata" in sql("SELECT detail FROM events WHERE kind = 'rafaga'")[0][0]
     assert "Varios estudiantes" in page
