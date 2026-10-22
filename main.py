@@ -1196,6 +1196,8 @@ def course_page(course_id: int, request: Request, msg: str = "", only_history: b
         links = f"<a href='/session/{s['id']}/report'>Reporte</a>"
         if s["active"]:
             links = f"<a href='/session/{s['id']}/live'>Pantalla en vivo</a> · " + links
+        else:
+            links += (f" · <a href='/session/{s['id']}/delete' style='color:var(--bad)'>Borrar</a>")
         session_rows += (f"<tr><td>#{s['id']}</td><td>{local(s['started_at'])}</td>"
                          f"<td>{ended}</td><td>{s['present']}</td><td>{links}</td></tr>")
 
@@ -1602,6 +1604,12 @@ def remove(course_id: int, request: Request, student_id: int = Form(...)):
         own_course(conn, teacher, course_id)
         conn.execute("DELETE FROM enrollments WHERE course_id = %s AND student_id = %s",
                      (course_id, student_id))
+        # Data that serves no class is not kept: a person removed from their
+        # only class, with no attendance left, is deleted entirely.
+        if not conn.execute("SELECT 1 FROM enrollments WHERE student_id = %s UNION ALL "
+                            "SELECT 1 FROM attendance WHERE student_id = %s LIMIT 1",
+                            (student_id, student_id)).fetchone():
+            conn.execute("DELETE FROM students WHERE id = %s", (student_id,))
     return RedirectResponse(f"/course/{course_id}", status_code=303)
 
 
@@ -2121,6 +2129,58 @@ def rename_course(course_id: int, request: Request, name: str = Form(...)):
         if new:
             conn.execute("UPDATE courses SET name = %s WHERE id = %s", (new, course_id))
     return RedirectResponse(f"/course/{course_id}?msg=Nombre guardado.", status_code=303)
+
+
+@app.get("/session/{session_id}/delete", response_class=HTMLResponse)
+def delete_session_page(session_id: int, request: Request, error: str = ""):
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        session = own_session(conn, teacher, session_id)
+        n = conn.execute("SELECT COUNT(*) AS n FROM attendance WHERE session_id = %s",
+                         (session_id,)).fetchone()["n"]
+    msg = "<div class='msg bad'>El número no coincide. No se borró nada.</div>" if error else ""
+    return teacher_page("Borrar sesión", f"""
+      <h1>Borrar la sesión #{session_id} de “{e(session['course_name'])}”</h1>{msg}
+      <div class="card" style="max-width:560px">
+        <p>Se borran esta toma de asistencia y sus {n} registros. Los estudiantes que solo
+        existían por esta sesión (marcaron sin estar en la lista y no tienen otra asistencia)
+        se borran también, con sus datos. <strong>No se puede deshacer.</strong>
+        Si necesitas el reporte, descárgalo antes.</p>
+        <form method="post" action="/session/{session_id}/delete">
+          <label for="confirm_id">Escribe el número de la sesión ({session_id}) para confirmar</label>
+          <input id="confirm_id" name="confirm_id" required autocomplete="off" inputmode="numeric">
+          <p style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn red" type="submit">Borrar para siempre</button>
+            <a class="btn grey" href="/course/{session['course_id']}/historial">Cancelar</a></p>
+        </form>
+      </div>""", teacher)
+
+
+@app.post("/session/{session_id}/delete")
+def delete_session(session_id: int, request: Request, confirm_id: str = Form(...)):
+    """
+    A test session, for example one taken with someone's national ID, can be
+    removed on its own. Students who exist only because of it go with it, so
+    no personal data from the test stays behind.
+    """
+    with db() as conn:
+        teacher = require_teacher(request, conn)
+        session = own_session(conn, teacher, session_id)
+        course_id = session["course_id"]
+        if confirm_id.strip().lstrip("#") != str(session_id):
+            return RedirectResponse(f"/session/{session_id}/delete?error=1", status_code=303)
+        marked = [r["student_id"] for r in conn.execute(
+            "SELECT student_id FROM attendance WHERE session_id = %s", (session_id,)).fetchall()]
+        conn.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+        for sid in marked:
+            if conn.execute("SELECT 1 FROM attendance WHERE student_id = %s", (sid,)).fetchone():
+                continue
+            # Pending in this class only because of the deleted session: out.
+            conn.execute("DELETE FROM enrollments WHERE course_id = %s AND student_id = %s "
+                         "AND status = 'pendiente'", (course_id, sid))
+            if not conn.execute("SELECT 1 FROM enrollments WHERE student_id = %s", (sid,)).fetchone():
+                conn.execute("DELETE FROM students WHERE id = %s", (sid,))
+    return RedirectResponse(f"/course/{course_id}/historial", status_code=303)
 
 
 @app.post("/session/{session_id}/groups")
