@@ -816,3 +816,48 @@ def test_removing_a_student_from_their_only_class_deletes_their_data():
     t.post(f"/session/{sid}/end", follow_redirects=False)
     t.post(f"/session/{sid}/delete", data={"confirm_id": str(sid)})
     assert sql("SELECT COUNT(*) FROM students WHERE id = %s", (st,))[0][0] == 0
+
+
+def _all_at_once(fn, n):
+    """Run fn(i) for i in range(n) in n threads released at the same instant."""
+    import threading
+    barrier = threading.Barrier(n)
+    out = [None] * n
+
+    def worker(i):
+        barrier.wait()
+        out[i] = fn(i)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    return out
+
+
+def test_a_whole_class_tapping_at_once_loses_and_doubles_nobody():
+    """A class of 100 taps Aceptar within seconds. Simulated here with 30 at the same instant."""
+    n = 30
+    roster = "\n".join(f"Estudiante Prueba {i}\t{300000000 + i}" for i in range(n))
+    t = teacher()
+    sid = start(t, create_course(t, roster=roster))
+    nonce = fresh_nonce(t, sid)
+    phones = [student() for _ in range(n)]
+    tickets = [ticket_of(p.get(f"/checkin?s={sid}&n={nonce}").text) for p in phones]
+    pages = _all_at_once(lambda i: phones[i].post("/checkin/accept", data={
+        "acepto": "1", "ticket": tickets[i], "carne": str(300000000 + i)}).text, n)
+    assert all("Asistencia recibida" in p for p in pages)
+    assert sql("SELECT COUNT(*), COUNT(DISTINCT student_id) FROM attendance "
+               "WHERE session_id = %s", (sid,))[0] == (n, n)
+
+
+def test_double_tap_on_aceptar_creates_one_attendance():
+    t = teacher()
+    sid = start(t, create_course(t, roster=ROSTER))
+    s = student()
+    tk = ticket_of(scan(s, t, sid).text)
+    pages = _all_at_once(lambda i: s.post("/checkin/accept", data={
+        "acepto": "1", "ticket": tk, "carne": "2021104567"}).text, 2)
+    assert sum("Asistencia recibida" in p for p in pages) == 1
+    assert sql("SELECT COUNT(*) FROM attendance")[0][0] == 1
