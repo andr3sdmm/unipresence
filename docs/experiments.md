@@ -61,7 +61,7 @@ After the pilot I talked with the professor. We wanted to simplify it for both s
 
 I also changed the teacher's screen: besides the QR and the counter, it now shows who is still missing (tapping a name marks them by hand), the last students who checked in, and a "Por revisar" list with the alerts. Before starting, the professor picks which groups are in the room.
 
-Evidence: `media/v2_01_pantalla_profesor.png`
+Evidence: `media/dia06_01_pantalla_profesor.png`
 
 **Design trade-off:** University codes are not secret, so they cannot protect registration the way private slips did. I accepted this on purpose: device changes are allowed but always recorded and shown to the teacher, so a misused code becomes visible instead of locking out a present student.
 
