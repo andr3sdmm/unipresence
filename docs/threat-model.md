@@ -28,9 +28,7 @@ A student could get another student's code and try to register attendance with i
 
 ### Registering several people from one phone
 
-One student could try to register attendance for several classmates using the same phone. Version 1 prevented this by associating the device with the first registered student. I tested this attack, and the system displayed: "Este teléfono ya está registrado — Andres Marino." In version 2, switching codes on a phone is recorded as a device change and shown to the teacher.
-
-<!-- verificar con el código de la v2: si un mismo teléfono puede marcar a dos estudiantes en la misma sesión, o si eso se bloquea -->
+One student could try to register attendance for several classmates using the same phone. Version 1 prevented this by associating the device with the first registered student. I tested this attack, and the system displayed: "Este teléfono ya está registrado — Andres Marino." In version 2 this cannot happen: a browser the app already knows only marks for its owner, and its check-in page has no field to type another code (`test_known_browser_cannot_mark_for_a_friend`).
 
 ### Device binding narrower than a device
 
