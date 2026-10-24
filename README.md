@@ -10,13 +10,11 @@ The challenge is not simply digitizing an attendance list. It is verifying that 
 
 ## How it works (version 2)
 
-The teacher creates an account, creates a class (with or without a student list) and presses "Tomar asistencia". The projector shows a QR code that changes every few seconds.
+The teacher creates an account, creates a class (with or without a student list) and presses "Tomar asistencia". The projector shows a QR code that changes every 10 seconds.
 
-The student points the phone camera at the QR, sees the name of the class and taps "Aceptar". The first time, the student enters their university code, which binds that phone to their identity. After that, scanning and tapping "Aceptar" is enough. A green confirmation on screen is the receipt.
+The student points the phone camera at the QR, sees the name of the class and taps "Aceptar". The first time, the student enters their university code or institutional username and accepts the data policy, which binds that phone to their identity. After that, scanning and tapping "Aceptar" is enough. A green confirmation on screen is the receipt.
 
 The server checks that the nonce in the QR exists and has not expired before recording attendance. If a code moves to a different phone or browser, the change is allowed but recorded, shown to the teacher during class and marked in the export. The browser used for each check-in is logged for fraud analysis.
-
-<!-- verificar con el código de la v2: intervalo de rotación del QR y momento exacto en que se pide el código universitario -->
 
 ## How the design changed after the first pilot
 
@@ -43,6 +41,21 @@ The pilot also lost its stored data when the free Render instance went to sleep.
 - Ending an attendance session and a page of previous classes
 - Persistent storage in Postgres
 - Automated tests
+
+Added in version 2.1, after testing with the professor's real lists:
+
+- Sign-in with the student code, the institutional username or the email (only the username is saved)
+- Data policy consent the first time a phone is linked (Colombia's Law 1581 of 2012)
+- Class lists exported from Brightspace or Banner, with groups
+- Students who are not on the list wait as pending, and the professor validates them against the list later
+- Correcting a student's code or name, and deleting test sessions with their data
+- Reports that can be sorted and filtered, with an anonymous export of check-in times
+
+## Results so far
+
+Two real classes in October 2026 with version 2.1: every present student checked in with the QR (20 of 20 and 15 of 15), and nobody had to be marked by hand. Once students start scanning, the whole class is in within about a minute. Whether it saves the professor time is not proven yet. The numbers, how each was measured, and what they do not show are in [`docs/results.md`](docs/results.md).
+
+![QR check-ins over time](media/dia09_01_qr_en_el_tiempo.png)
 
 ## What is not built yet
 
@@ -89,7 +102,7 @@ TEST_DATABASE_URL="postgresql://..." pytest -q
 
 ## Project log
 
-Development decisions, tests, failures, and changes are documented in [`docs/experiments.md`](docs/experiments.md).
+Development decisions, tests, failures, and changes are documented in [`docs/experiments.md`](docs/experiments.md). What data is stored and why is in [`docs/data-handling.md`](docs/data-handling.md).
 
 ## A note on how this was built
 
