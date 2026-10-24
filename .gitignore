@@ -2,9 +2,13 @@ venv/
 __pycache__/
 *.db
 .DS_Store
+.env
+
+# Real data never goes into this repository
 roster.csv
 codes_to_print.html
 prueba.csv
-roster.csv
-codes_to_print.html
-prueba.csv
+*.xlsx
+*.xls
+*.mp4
+*.mov
