@@ -1,139 +1,85 @@
-# Attack protocol
+# Attack protocol — version 2.1
 
-Written in English because the results feed straight into `threat-model.md`.
-
-Run every attack exactly as written, even the ones expected to fail. A
-defence that has never been attacked is an assumption, not a defence.
-
----
+Five attacks against the app as it runs in class, done by hand with real phones. Each one tests one claim from `threat-model.md`. The expected messages are the ones the app actually shows (checked in `main.py`). Attacks that are expected to fail are run anyway, because a defence that was never attacked is only an assumption.
 
 ## Setup
 
-**Devices**
+- A separate class called "Prueba de ataques", with a made-up list of three students (codes 900000001, 900000002, 900000003). No real students take part.
+- Laptop: the professor's live screen, logged in, attendance running.
+- Phone A: the student in the room, linked to 900000001.
+- Phone B: the student at home, linked to 900000002, in another room.
+- Phone C: a phone that has never used the app.
+- Both phones A and B scan once before starting, so they are already linked.
+- Each phone screen-records the whole session. At the end, a screenshot of "Por revisar" and the report, and the "Tiempos (anónimo)" file is downloaded. After that, the test session is deleted with "Borrar sesión".
 
-- Mac: teacher screen, logged in, attendance session running
-- Phone A: "the student in the room". Registered to a roster code.
-- Phone B: "the student at home". Also registered, to a different code.
+Before starting, write down the date, the time and where each phone is.
 
-Both phones must already be registered before starting. Registration is not
-what is being attacked here.
+## Attack 1 — photo of an old QR
 
-**Recording**
+Claim tested: an old QR is useless.
 
-Screen-record both phones for the whole session (iPhone: Control Centre →
-record button). One continuous recording per phone is easier than starting
-and stopping between attacks.
+1. Phone A takes a photo of the QR on the laptop and notes the second.
+2. After 30 seconds, the photo is sent to phone B.
+3. Phone B scans the photo.
 
-Also screenshot the uvicorn or Render logs at the end. They show the
-requests with timestamps, which is independent evidence of what happened.
+Expected: "Vuelve a escanear. Ese QR ya venció." No attendance is recorded. The report counts one "Escaneó un QR vencido".
 
-**Before starting, write down**
+## Attack 2 — live relay over a video call
 
-- Date and time
-- Which code is on which phone
-- Where each phone physically is
+Claim tested: none. This attack is expected to work, and that is the main open risk.
 
----
+1. Phone A starts a video call with phone B and points its camera at the QR on the laptop.
+2. Phone B scans the QR from the call, with a third device or from a screenshot taken during the call, and taps Aceptar.
+3. Repeat ten times, noting how long each attempt took and how many failed.
 
-## Attack 1 — delayed screenshot
+Expected: "Asistencia recibida" on phone B, even though it is not in the room. The server records how old the QR was when it was scanned (`qr_age_s`). That is the number `analysis/relay_analysis.py` compares with real students in class: if relayed scans are always older, a shorter QR lifetime would stop most relays without locking out students in the room.
 
-*Claim being tested: an expired QR is useless.*
+## Attack 3 — a friend's code on another phone
 
-1. On phone A, screenshot the QR projected on the Mac.
-2. Note the exact second.
-3. Wait 30 seconds. Say it out loud on the recording so the delay is visible.
-4. Send the screenshot to phone B.
-5. On phone B, scan the screenshot from phone A's screen.
+Claim tested: a code that moves to another phone does not go unnoticed.
 
-**Expected:** rejected, "Este codigo ya expiro".
+1. Phone C, which has never used the app, scans the QR.
+2. It types 900000001 (phone A's student), accepts the policy and taps Aceptar.
 
-**Record:** the message shown, and the delay between screenshot and scan.
+Expected: the check-in is accepted on purpose (a present student is never refused), and the professor's screen shows under "Por revisar": "Su carné pasó a otro navegador o celular durante la clase". The professor can reject it, and the decision stays on record.
 
----
+## Attack 4 — marking a friend from your own phone
 
-## Attack 2 — live relay
+Claim tested: a phone the app knows only marks for its owner.
 
-*Claim being tested: nothing stops this. This is the finding.*
+1. Phone A, already linked, scans the QR.
+2. Look for a way to enter a different code.
 
-This is the most important of the three. It is expected to succeed, and its
-success is what justifies the BLE phase.
+Expected: the page only shows the class, the name of phone A's student and the Aceptar button. There is no field to type another code, so phone A can only mark its own student.
 
-1. Put phone B in another room, out of sight of the Mac.
-2. Video call between phone A and phone B, or just carry phone B while phone
-   A points at the screen — whatever simulates a student relaying the QR in
-   real time.
-3. Phone A shows the live QR to phone B through the call.
-4. Phone B scans it from the video, inside the 10-second window.
+## Attack 5 — the QR without being the professor
 
-**Expected:** attendance recorded. The system cannot tell the difference.
+Claim tested: the QR only exists on the professor's screen. In version 1 this address was public for a while.
 
-**Record:** the success screen, and how many attempts it took to hit the
-window. If it takes several tries, that is a finding too: the attack works
-but is not effortless.
+1. On phone B, in a private window, open `/session/<id>/qr` with the id of the running session.
+2. Try the ids before and after it.
 
-**Also measure:** how long the whole relay took. If it takes a student 25
-seconds of fiddling to mark a friend present, that is a different threat
-than if it takes 3.
+Expected: no QR image. The app sends the request to the login page.
 
----
+## Already covered by automated tests
 
-## Attack 3 — two students from one phone
+These are checked on every commit, so they are not repeated by hand: a class that ended accepts nothing, a scan cannot be used twice, a double tap creates one attendance, and professors cannot see each other's classes. See `testing.md`.
 
-*Claim being tested: one phone belongs to one student.*
-
-1. On phone A, already registered, open `/register`.
-2. Try to register with a second, unused roster code.
-
-**Expected:** rejected, "Este telefono ya esta registrado", showing the name
-it already belongs to.
-
-**Record:** the message, including the name shown.
-
----
-
-## Attack 4 — direct access to the QR endpoint
-
-*Claim being tested: the QR only exists where the teacher projects it.*
-
-Already done once, but repeat it properly and keep the evidence.
-
-1. On phone B, in a private tab, open `<url>/qr/<session id>` directly.
-2. Try session ids 1, 2 and 3 as well, since they are guessable.
-
-**Expected:** 401, no image.
-
-**Record:** the response, and a note that before authentication this returned
-a valid nonce to anyone.
-
----
-
-## Results table
-
-Fill this in as you go, not afterwards from memory.
+## Results
 
 | Attack | Expected | What happened | Evidence |
 |---|---|---|---|
-| 1. Delayed screenshot | rejected | | |
-| 2. Live relay | succeeds | | |
-| 3. Two students, one phone | rejected | | |
-| 4. Direct QR endpoint | 401 | | |
+| 1. Photo of an old QR | rejected, "Ese QR ya venció" | | |
+| 2. Live relay | works | | |
+| 3. Friend's code on another phone | accepted + alert under "Por revisar" | | |
+| 4. Friend from your own phone | impossible, no code field | | |
+| 5. QR without login | login page, no image | | |
 
----
+For attack 2, also: attempts, how many worked, and the time from the start of the call to the receipt.
 
-## After
+## Afterwards
 
-**Update `threat-model.md`.** Attack 2 currently says "I have not tested this
-attack yet". Replace that with what actually happened, including how long the
-relay took. If it succeeded, say so plainly.
-
-**Add a `experiments.md` entry**: what you built the setup out of, what you
-tested, what failed, what you decided.
-
-**Save the recordings** in `media/`. Trim them: a 4-minute video of you
-fumbling with two phones is not evidence, a 15-second clip of the rejection
-message is.
-
-**One warning.** If attack 2 fails — if the relay does not work — do not
-write that the system prevents it. It would mean the attempt was too slow,
-not that the defence exists. Say what you observed and what you could not
-conclude from it.
+- `threat-model.md`: replace "I have not tested this attack yet" in the live relay section with what happened.
+- `experiments.md`: a new day with what was tested, what failed and what was decided.
+- `analysis/data/`: the anonymous times of the relay attempts, next to the times of a real class.
+- `media/`: short clips or screenshots of each result. If attack 2 does not work, that does not mean the app prevents it; it only means those attempts were too slow, and the entry says so.
