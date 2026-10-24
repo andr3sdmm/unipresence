@@ -1,182 +1,70 @@
-# Plan del piloto — lab de genética, lunes
+# Pilot plan — classes with version 2.1
 
-Este documento está en español a propósito: lo van a usar dos personas en un
-salón colombiano, igual que la interfaz. El reporte de resultados va en inglés.
+How we run and measure a real class with the app. We follow this same plan in every measured class, so the numbers can be compared.
 
----
+## What we want to know
 
-## 1. Antes del domingo en la noche
+1. Does the QR take less of the professor's time than calling names, when both are measured the same way, from start to finish?
+2. Does every student who is in the room end up marked, and only them?
+3. What does the professor still have to do by hand?
 
-**Conseguir la lista del lab.** Nombres de los estudiantes, en Excel o como
-sea que te la pase. Sin esto no hay nada que hacer.
+## Before class
 
-**Exportar a CSV.** En Numbers o Excel: Archivo → Exportar a → CSV.
+- The class list (Banner, with the 9-digit codes) is uploaded and the right groups are checked.
+- Students who were pending from earlier classes are validated with "Validar con la lista".
+- Nothing in the app changes on the day of a measured class. A change in the middle would make the numbers impossible to compare.
 
-**Generar los códigos.**
+## During class
 
-```
-python3 generate_codes.py lista-lab.csv "Genetica - Lab"
-```
+The order matters: first the QR, then the roll call. Calling names afterwards gives an independent check of who was really in the room.
 
-**Imprimir los papelitos.** Abre `codes_to_print.html`, Cmd+P, imprime,
-corta. Guárdalos en orden alfabético para repartirlos rápido.
+**With the QR.** The server saves the time the session opens, every check-in to the second, and the time it ends. The professor only has to:
 
-**Subir la lista real a Render** — este es el paso que se olvida:
+1. Tap "Tomar asistencia" when she is ready to start, not before.
+2. Check "Por revisar" and mark by hand whoever needs it.
+3. Tap "Terminar asistencia" as soon as she finishes reviewing. That is the end of the QR time.
 
-1. Entra a tu servicio en render.com
-2. Menú izquierdo → **Environment**
-3. Sección **Secret Files** → **Add Secret File**
-4. Filename: `roster.csv`
-5. Contents: pega el contenido completo del `roster.csv` que generó el script
-6. Save
+**By hand.** A stopwatch or a video from the moment she opens the list until she finishes correcting it. She marks who answers.
 
-Render lo coloca junto al código al arrancar. Nunca pasa por GitHub, así que
-los nombres reales no quedan públicos.
+**On paper:** start and end time of the roll call, students who arrived between the two methods, and anything that went wrong (the page did not load, someone could not scan, questions students asked).
 
-**Desplegar y verificar.** Después de guardar el secret file, Render
-redespliega. Espera a que diga "Live" y entra a la URL. En los logs de Render
-debe decir `Course roster loaded. New students: N`, donde N es el número real
-de estudiantes del lab.
+## Right after class
 
-> Si dice `New students: 0`, la base de datos ya tenía la lista vieja de
-> prueba. En ese caso hay que borrarla, y la forma más simple en el plan
-> gratuito es esperar a que el servicio se reinicie solo, o hacer un
-> "Manual Deploy → Clear build cache & deploy".
+A five-minute interview with the professor:
 
-**Probar el flujo completo en producción**, con tu propio teléfono y un
-código real de la lista. Regístrate, inicia sesión de asistencia, escanea.
-Si funciona con uno, funciona con veinte.
+1. How long does the roll call usually take in this class? Was today a normal day?
+2. Which part of the QR took the most time?
+3. Could you tell quickly who was missing and who needed review?
+4. Did any student fail to check in? Why?
+5. If you only used the QR tomorrow, what would you still need the paper list for?
 
-**Definir la contraseña que va a usar tu mamá** y dársela. Que no sea la de
-la universidad. 
+## What we compare
 
-**Y a partir de ahí, congelar.** El plan gratuito de Render borra la base de
-datos en cada despliegue. Desde que subes la lista real hasta que descargas
-el CSV al salir del salón, no hagas `git push`, no cambies el Secret File,
-no toques nada en Render. Cualquiera de esas cosas dispara un despliegue y
-se pierden todos los registros y toda la asistencia.
+| Measure | QR | By hand |
+|---|---|---|
+| Total time | session opened → session ended (server) | list opened → last correction (stopwatch or video) |
+| Capture time | first check-in → last check-in (server) | first name → last name |
+| Review time | last check-in → session ended | — |
 
-Si necesitas arreglar algo del código, hazlo antes de subir la lista, o
-después de descargar el CSV. Nunca en el medio.
+And who was present, crossing both methods:
 
----
+| | Answered the roll call | Did not answer |
+|---|---|---|
+| Checked in with the QR | correct | check: arrived late, or marked from outside? |
+| Did not check in | check: why not? | absent |
 
-## 2. El día, antes de entrar al salón
+Unclear cases stay in their own group instead of being forced into one.
 
-**Despierta el servicio.** El plan gratuito de Render duerme por inactividad
-y la primera petición puede tardar casi un minuto. Abre la URL **diez minutos
-antes** de que empiece la clase y déjala abierta.
+## What goes into the repository
 
-**Lleva un plan B en papel.** Una lista impresa con los nombres, para marcar
-a mano si algo se cae. No es pesimismo: es lo que permite que la clase siga
-si falla el WiFi.
+- The anonymous timing export ("Tiempos (anónimo)"), which only has seconds.
+- The numbers and the interview answers, without names.
+- Screenshots only with every name and code covered.
 
-**Carga el computador de tu mamá** y confirma que el proyector conecta.
+The report with names, the class list and any video stay with the professor and never go into the repository.
 
----
+## If something fails
 
-## 3. El minuto a minuto
-
-**Paso 1 — La medición base, antes de mencionar el sistema.**
-
-Tu mamá llama a lista como siempre lo hace. Tú cronometras con el celular,
-desde que dice el primer nombre hasta que termina. **Anota el número exacto
-y cuántos estudiantes había.**
-
-Este es el dato más importante de todo el proyecto. Sin él, cualquier cosa
-que digas después es una estimación.
-
-**Paso 2 — Explicar, en menos de un minuto.**
-
-Tu mamá les dice: que es un sistema de asistencia que está probando, que lo
-construyó un estudiante de colegio, que no recoge ubicación ni datos
-biométricos, solo el código y la hora. Y que la asistencia de hoy ya quedó
-tomada por la vía normal, así que esto no afecta a nadie.
-
-Esa última frase importa: quita la presión y hace que nadie sienta que su
-nota depende de un experimento.
-
-**Paso 3 — Repartir los papelitos.**
-
-Uno por persona, en la mano. No los leas en voz alta. Si sobran papelitos,
-son los ausentes: guárdalos.
-
-**Paso 4 — Registro.**
-
-Proyecta el QR de registro (`/qr-register-page`). Cada uno escanea, escribe
-su código, confirma su nombre. **Cronometra cuánto tarda el último en
-terminar.**
-
-Aquí es donde más probable es que algo se trabe. Ten paciencia y anota qué
-falla: teléfonos sin datos, códigos mal copiados, gente que no entiende la
-pantalla.
-
-**Paso 5 — Asistencia.**
-
-Vuelve al inicio, "Iniciar asistencia", proyecta el QR rotativo.
-**Cronometra desde que aparece el QR hasta que el contador deja de subir.**
-
-**Paso 6 — Los que faltaron.**
-
-Con el botón de agregar manualmente, mete a quien no pudo. Anota cuántos
-fueron y por qué.
-
-**Paso 7 — Terminar y descargar.**
-
-Botón rojo, y **descarga el CSV inmediatamente**. En el plan gratuito de
-Render los datos se pierden si el servicio se reinicia. Descárgalo antes de
-salir del salón.
-
----
-
-## 4. Qué anotar
-
-Lleva una libreta o una nota en el celular con estos campos vacíos, listos
-para llenar:
-
-- Estudiantes presentes: ____
-- Tiempo del llamado a lista tradicional: ____
-- Tiempo del registro inicial: ____
-- Tiempo de la asistencia con el sistema: ____
-- Cuántos se registraron sin problema: ____
-- Cuántos necesitaron ayuda: ____
-- Cuántos hubo que agregar a mano, y por qué: ____
-- Qué preguntó la gente: ____
-- Qué dijo tu mamá después: ____
-
-Las dos últimas valen tanto como los números. Una pregunta repetida por
-cinco estudiantes es un problema de diseño.
-
----
-
-## 5. Si algo falla
-
-**El WiFi no funciona.** Que usen datos móviles. Si tampoco, se cae la
-prueba: pasa al plan B en papel y lo intentas otro día. Anótalo como
-resultado, no como fracaso — la dependencia de conectividad es un hallazgo
-real.
-
-**Un estudiante no puede registrarse.** No te detengas a depurar en vivo.
-Anota su nombre y el mensaje que le salió, agrégalo a mano, y sigue. Lo
-investigas después.
-
-**El servicio está dormido y no carga.** Espera un minuto completo antes de
-tocar nada. Si sigue sin cargar, plan B en papel.
-
-**Se cierra el navegador.** No pasa nada: entra otra vez, "Ver clases
-anteriores", y ahí está la sesión con su link de descarga. Eso lo
-construimos justamente para esto.
-
----
-
-## 6. Apenas salgas del salón
-
-Antes de que se te olvide, mientras está fresco:
-
-- Verifica que el CSV está descargado y tiene los datos
-- Escribe la entrada del día en `experiments.md`
-- Toma foto de tus notas
-
-Y si tu mamá dijo algo sobre qué le gustaría que el sistema hiciera, anótalo
-textual. Eso es lo que define qué se construye después — no lo que se te
-ocurra a ti frente al computador.
+- **A student cannot check in:** do not debug it in class. Write down what the screen said, mark them by hand, keep going.
+- **The page does not load:** wait a minute. If it still fails, take attendance on paper and write it down as a result, not as a failure.
+- **The browser closes:** log in again; the session is still under the class history.
