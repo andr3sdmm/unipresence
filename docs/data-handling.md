@@ -1,88 +1,56 @@
 # Data handling — UniPresence
 
+This describes version 2.1, the one used in the October 2026 classes.
+
 ## What the system stores
 
-UniPresence currently stores only the information needed to register students and record attendance:
+For each student:
 
-- **Student code:** identifies the student during registration.
-- **Student name:** obtained from the course list and used to identify attendance records.
-- **Device identifier:** a randomly generated identifier used to bind a browser to one student. It is not an IMEI, hardware identifier, phone number, or other identifier obtained from the device itself.
-- **Registration/check-in timestamp:** records when an attendance action occurred.
-- **Attendance method:** records whether attendance was registered through the QR flow or manually by the professor.
-- **Registration context:** records whether the action occurred during pre-class registration or classroom attendance.
+- **Student code or username:** the code the student types the first time, or their institutional username (the part of the email before the @). The full email address is never saved.
+- **Name:** from the class list, or typed by the student in a class without a list. The surname is kept separately when the list has it, so reports can be sorted by last name.
+- **Group:** the group or NRC from the list, when the list has it.
+- **Device identifier:** a random code created by the server and saved in a cookie, used to recognize the browser the student links. It is not the phone number, an IMEI or anything read from the phone.
+- **When they accepted the data policy.**
 
-The roster is handled in two parts. `roster.example.csv` is committed to this repository and contains fictional names created only for testing. The real course roster lives in `roster.csv`, which is listed in `.gitignore` and is never committed.
+For each check-in:
 
-In production the real roster is uploaded to Render as a secret file. Render places it next to the application when the service deploys, so it never passes through the public repository.
+- The time, and whether it was done with the QR or marked by hand by the professor.
+- The browser, the phone's operating system, and whether the link was opened inside an app such as WhatsApp. This is how the system notices patterns like several new phones linked in a few seconds.
+- How old the QR was when it was scanned and how long the student took to tap "Aceptar". These are for the relay test in `docs/attack-protocol.md`.
+- A receipt code, the same one the student sees on their phone.
 
+For each change of phone or browser, and for each alert under "Por revisar": what happened, when, and the professor's decision.
 
-## What is stored on the student's device
-
-UniPresence stores a cookie on the student's device after registration. The cookie contains only a randomly generated device identifier. It does not contain the student's name, student code, or any hardware identifier from the phone.
-
-The cookie is marked `HttpOnly`, which prevents JavaScript running on the page from reading it, and it is configured to remain on the device for one year.
-
-This cookie allows the server to recognize that a particular browser has already been registered to a student. If the student clears their browser data, deletes the cookie, changes browsers, or moves to another device, that binding is lost and the student must register again.
-
-The server stores the relationship between the random device identifier and the student record; the cookie itself only carries the random identifier.
-
+For each professor: email, name, institution and a password stored only as a bcrypt hash.
 
 ## What the system does not store
 
-UniPresence does not store:
+- Location (GPS or any other kind)
+- Photos or biometric data
+- Phone numbers, IMEI or other hardware identifiers
+- IP addresses
+- Full email addresses of students
 
-- GPS coordinates or other location data
-- Biometric information
-- Photographs
-- IP addresses associated with individual students
-- Browsing history
-- IMEI numbers or other hardware identifiers from students' phones
+## What is stored on the student's phone
 
-The system is intentionally designed to avoid collecting information that is not necessary for attendance verification.
+One cookie, `device_id`, with the random identifier and nothing else. It is `HttpOnly` (JavaScript on the page cannot read it) and lasts one year unless the student clears their browser data. If they do, or change browsers or phones, they type their code again; the change is allowed and recorded.
 
+## Consent
+
+The first time a phone is linked, the student has to check "Acepto la política de tratamiento de datos" before anything is saved. The policy is at `/privacidad`, in Spanish: what is saved, what is not, what for, who sees it, and that the student can ask to see, correct or delete their data. If they do not accept, nothing is saved and the professor can mark them by hand. This follows the prior, informed authorization that Colombia's Law 1581 of 2012 asks for.
 
 ## Who can access it
 
-In the current version, attendance information and teacher functions are accessible only after entering the shared teacher password.
+- **Professors:** each one has their own account and only sees their own classes. Sessions expire after 12 hours.
+- **Students:** only see their own receipt on their own phone.
+- **Me:** as the owner of the database, I can technically see everything stored in it. That is a real limitation of a student project; a university deployment would need the database to be run by the university.
 
-Earlier versions did not enforce this restriction. The teacher interface and QR endpoint were initially accessible to anyone who had the corresponding URL. This was identified during security review and corrected by placing both endpoints behind the authenticated teacher session.
+## Where it is stored and for how long
 
-The current shared-password approach limits access, but it does not identify which individual professor performed an action if multiple people know the password.
+Since October 18, 2026, everything is stored in a Postgres database on Neon, outside the Render server, so restarts and new deploys no longer erase anything (that is what happened on September 22). The database is in Neon's AWS region in Oregon, United States. Under Law 1581, storing Colombian personal data in another country is an international transfer, which a real deployment would have to review.
 
+There is no automatic deletion yet. Data stays for the whole semester, until the professor deletes it:
 
-## How long it is kept
-
-The prototype currently has no automatic data-deletion or retention policy.
-
-At the same time, the current free Render deployment does not provide reliable persistent storage for this data. Stored information is lost whenever the service restarts or redeploys, and a redeploy is triggered by any change to the code or the configuration. In practice this means attendance records have to be exported immediately after each class.
-
-These are separate limitations: the application does not intentionally delete records after a defined period, but the current hosting environment also does not guarantee that they will remain stored.
-
-The device cookie is configured to remain on the student's browser for one year unless the student deletes it earlier by clearing their browser data.
-
-
-## Legal context
-
-UniPresence would handle personal data in Colombia and would therefore need to be evaluated under Colombia's personal-data protection framework, including **Law 1581 of 2012**.
-
-Among other principles, the law requires personal-data processing to have a legitimate and communicated purpose, generally requires prior and informed authorization from the data subject, restricts access to authorized persons, and requires appropriate measures to protect records against unauthorized access, loss, alteration, or fraudulent use.
-
-It also gives data subjects rights regarding their personal information, including the ability to know, update, and correct their data.
-
-This prototype has not undergone a formal legal or institutional compliance review and should not be considered production-ready based on this document alone.
-
-
-## What a real deployment would need
-
-Before UniPresence could be used with real university student records, it would need at least:
-
-- A defined data-retention and deletion policy
-- An appropriate process for informing students and obtaining any authorization required for processing their personal data
-- Persistent and backed-up database storage
-- The university's institutional authentication instead of a shared teacher password
-- The real course list stored securely outside the public source-code repository
-- Procedures allowing students to access or correct their personal information when required
-- A process for handling students who change devices, browsers, or clear their browser data
-- Institutional review of the system's privacy, security, and data-handling practices
-
-A production deployment would also need to define who is responsible for the data, who is authorized to access it, why each field is collected, and how incidents or unauthorized access would be handled.
+- Deleting a class deletes its sessions, its attendance and its alerts.
+- Deleting a session (for example, a test) deletes its attendance, and also the students who only existed because of that test.
+- Removing a student from their only class deletes that student's data.
