@@ -21,14 +21,14 @@
 
 Three additional problems were identified during a review of the design with an AI assistant. A student could register using another student's code if they obtained it before the real owner used it. The review also identified that the teacher screen was accessible without authentication and that the `/qr/{session_id}` endpoint was public, allowing anyone with the URL to obtain a valid nonce. The teacher screen and QR endpoint were later placed behind the authenticated teacher session, while the assigned-code system was redesigned to reduce the risk of code misuse.
 
-**What I decided:** I decided to ask for the student's private code before showing or requesting their name so the course list is not exposed during registration. I also decided to use English for the repository and technical documentation, while keeping the student-facing interface in Spanish. For the current prototype, teacher access uses a shared password stored outside the repository as an environment variable. A future production version should use Universidad del Norte's institutional login instead.
+**What I decided:** I decided to ask for the student's private code before showing or requesting their name so the course list is not exposed during registration. I also decided to use English for the repository and technical documentation, while keeping the student-facing interface in Spanish. For the current prototype, teacher access uses a shared password stored outside the repository as an environment variable. A future production version should use University's institutional login instead.
 
 **Still open:** The timestamps in the exported CSV are still displayed in UTC and need to be converted to the appropriate local time.
 
 
 ## Day 4 — September 22, 2026: first classroom pilot
 
-**What I tested:** The system ran in a real genetics lab at Universidad del Norte: 22 students, the professor operating it alone. Each student received a printed slip with their private code, registered through a registration QR, and then scanned the rotating attendance QR.
+**What I tested:** The system ran in a real genetics lab at the university: 22 students, the professor operating it alone. Each student received a printed slip with their private code, registered through a registration QR, and then scanned the rotating attendance QR.
 
 **What happened:** 15 students checked in. 7 could not.
 
@@ -53,12 +53,19 @@ Evidence of the fix: `media/dia04_06_casilla_vincular.png`, `media/dia04_07_vinc
 
 ## Version 2 — October 2026
 
-**Why:** The September 22 pilot showed that the real failure point was friction for students, and that the free deployment could lose data.
+**Why:** The September 22 pilot showed that the real failure point was friction for the students, and that the free deployment could lose data. 
+
+After the pilot I talked with the professor. We wanted to simplify it for both sides: she uploads her class list once, and a student only types their ID the first time; after that, scanning and tapping "Aceptar" is enough. We also kept the option to take attendance without a list. A class can start empty and build its list from the people who check in. We were thinking of cases where people are not on any list, like a conference, where each person registers with their name and an ID.
 
 **What I built:** Students scan one QR, see the class name and tap "Aceptar". The first time, they enter their university code, which binds the phone; slips and the separate registration link are no longer needed. The browser used for each check-in is logged for fraud analysis. Teachers have individual accounts (optionally restricted by a signup code), can create classes with or without a student list, upload the list once through the interface, and export attendance to CSV or PDF. All data is stored in Postgres, and the project has automated tests.
+
+I also changed the teacher's screen: besides the QR and the counter, it now shows who is still missing (tapping a name marks them by hand), the last students who checked in, and a "Por revisar" list with the alerts. Before starting, the professor picks which groups are in the room.
+
+Evidence: `media/v2_01_pantalla_profesor.png`
 
 **Design trade-off:** University codes are not secret, so they cannot protect registration the way private slips did. I accepted this on purpose: device changes are allowed but always recorded and shown to the teacher, so a misused code becomes visible instead of locking out a present student.
 
 **Next:** Time a manual roll call (paper list, no sign-in sheet) in a small class and then in a large one, to have a baseline. Only then run the version 2 pilot and compare. Results go in `docs/results.md`.
 
-<!-- Agregar aquí: fecha exacta en que se terminó la v2, qué se probó y qué falló durante la reescritura. -->
+**Finished:** October 18, 2026.
+
