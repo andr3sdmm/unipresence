@@ -48,7 +48,7 @@ código real de la lista. Regístrate, inicia sesión de asistencia, escanea.
 Si funciona con uno, funciona con veinte.
 
 **Definir la contraseña que va a usar tu mamá** y dársela. Que no sea la de
-Uninorte. 
+la universidad. 
 
 **Y a partir de ahí, congelar.** El plan gratuito de Render borra la base de
 datos en cada despliegue. Desde que subes la lista real hasta que descargas

@@ -79,7 +79,7 @@ Before UniPresence could be used with real university student records, it would 
 - A defined data-retention and deletion policy
 - An appropriate process for informing students and obtaining any authorization required for processing their personal data
 - Persistent and backed-up database storage
-- Universidad del Norte institutional authentication instead of a shared teacher password
+- The university's institutional authentication instead of a shared teacher password
 - The real course list stored securely outside the public source-code repository
 - Procedures allowing students to access or correct their personal information when required
 - A process for handling students who change devices, browsers, or clear their browser data

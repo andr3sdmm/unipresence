@@ -64,6 +64,6 @@ The system still has some risks that it does not completely solve. A student may
 
 University codes are not secret, so in version 2 a student can move a classmate's registration to their own phone. The system records and displays this instead of preventing it. Detection depends on the teacher looking at the device-change count and the export.
 
-Version 1 used a shared teacher password, which could not identify which teacher performed an action. Version 2 replaces it with individual teacher accounts, so actions can be associated with a specific account. Anyone who knows the optional signup code can still create a teacher account; the signup code is a shared secret. Integrating Universidad del Norte's institutional login would close this gap and is outside the scope of the current prototype.
+Version 1 used a shared teacher password, which could not identify which teacher performed an action. Version 2 replaces it with individual teacher accounts, so actions can be associated with a specific account. Anyone who knows the optional signup code can still create a teacher account; the signup code is a shared secret. Integrating the university's institutional login would close this gap and is outside the scope of the current prototype.
 
 Version 1 ran on the free Render plan, which put the service to sleep after inactivity and lost stored data during the September 22 pilot. Version 2 stores all data in Postgres, so data survives restarts.
