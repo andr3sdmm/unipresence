@@ -861,3 +861,14 @@ def test_double_tap_on_aceptar_creates_one_attendance():
         "acepto": "1", "ticket": tk, "carne": "2021104567"}).text, 2)
     assert sum("Asistencia recibida" in p for p in pages) == 1
     assert sql("SELECT COUNT(*) FROM attendance")[0][0] == 1
+
+
+def test_projected_screen_hides_names_and_report_shows_alerts_first():
+    """The live screen is projected: names stay hidden until the professor opens them."""
+    t = teacher()
+    sid = start(t, create_course(t, roster=ROSTER))
+    page = t.get(f"/session/{sid}/live").text
+    assert re.search(r'<div id="details"[^>]*hidden>', page)
+    assert "Mostrar ausentes y alertas" in page
+    report = t.get(f"/session/{sid}/report").text
+    assert report.index('id="por-revisar"') < report.index('id="report"')
