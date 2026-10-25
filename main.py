@@ -1884,6 +1884,7 @@ LIVE_PAGE = """
   .absent-btn:hover { border-color:var(--ok); }
   .alert { background:var(--warn-soft); border-radius:8px; padding:8px 10px; font-size:14px; }
   .recent { font-size:14px; }
+  #details[hidden] { display:none !important; }
 </style>
 <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
   <h1>__COURSE__</h1>
@@ -1903,6 +1904,13 @@ LIVE_PAGE = """
       <div id="count">0</div>
       <div id="pending" class="hint"></div>
     </div>
+    <!-- The live screen is usually projected, so names stay hidden until the
+         professor opens them. Students in the room only see the QR and the count. -->
+    <div class="card">
+      <button id="toggle" class="btn light" type="button" onclick="toggleDetails()">Mostrar ausentes y alertas</button>
+      <p class="hint" style="margin:6px 0 0">Muestra nombres. Ábrelo cuando no estés proyectando.</p>
+    </div>
+    <div id="details" style="display:grid;gap:14px" hidden>
     <div class="card">
       <strong>Por revisar</strong>
       <div id="alerts" class="list"><span class="muted">Nada por ahora.</span></div>
@@ -1920,12 +1928,24 @@ LIVE_PAGE = """
       <p id="manualMsg" class="hint"></p>
     </div>
     <div class="card recent"><strong>Últimos en marcar</strong><div id="recent" class="list"></div></div>
+    </div>
   </div>
 </div>
 <script>
 const SID = __SID__, ROT = __ROT__;
 function refreshQR() { document.getElementById('qr').src = '/session/' + SID + '/qr?t=' + Date.now(); }
 refreshQR(); setInterval(refreshQR, ROT * 1000);
+
+let open = false, alertCount = 0;
+function toggleDetails() {
+  open = !open;
+  document.getElementById('details').hidden = !open;
+  label();
+}
+function label() {
+  const n = alertCount ? ' (' + alertCount + ' por revisar)' : '';
+  document.getElementById('toggle').textContent = (open ? 'Ocultar' : 'Mostrar') + ' ausentes y alertas' + n;
+}
 
 function el(tag, text, cls) { const n = document.createElement(tag); n.textContent = text; if (cls) n.className = cls; return n; }
 
@@ -1939,6 +1959,7 @@ async function poll() {
   document.getElementById('pending').textContent =
     d.pending ? d.pending + ' estudiante(s) nuevos por aprobar al final' : '';
 
+  alertCount = d.alerts.filter(a => !a.decision).length; label();
   const alerts = document.getElementById('alerts'); alerts.innerHTML = '';
   if (!d.alerts.length) alerts.appendChild(el('span', 'Nada por ahora.', 'muted'));
   d.alerts.forEach(a => {
@@ -2707,6 +2728,9 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
         <a class="stat" href="#por-revisar"><b>{len(alerts)}</b>por revisar</a>
         <div class="stat" title="Alguien escaneó un QR viejo y la app le pidió escanear otra vez. No es de un estudiante en particular."><b>{expired}</b>escaneos de QR vencido</div>
       </div>
+      <h2 id="por-revisar">Por revisar</h2>
+      {alerts_html}
+      <p class="hint">Estas señales son pistas, no pruebas. Si algo no cuadra, pregúntale al estudiante.</p>
       <form class="noprint" method="get" style="display:flex;gap:8px;align-items:center;max-width:420px;margin-bottom:12px">
         <label for="tarde" style="margin:0;white-space:nowrap">Tarde después de</label>
         <input id="tarde" name="tarde" type="number" min="0" max="240" value="{tarde}" style="width:90px">
@@ -2749,9 +2773,6 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
       }}
       sortReport('apellido');
       </script>
-      <h2 id="por-revisar">Por revisar</h2>
-      {alerts_html}
-      <p class="hint">Estas señales son pistas, no pruebas. Si algo no cuadra, pregúntale al estudiante.</p>
       <div class="sign"><div>Firma del profesor</div><div>Fecha</div></div>
     """, teacher)
 
