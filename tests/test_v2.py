@@ -956,3 +956,16 @@ def test_a_username_approved_by_hand_can_still_be_joined_to_its_list_row():
     assert sql("SELECT COUNT(*) FROM enrollments WHERE course_id = %s", (cid,))[0][0] == 3
     assert sql("SELECT carne, username FROM students WHERE id = %s", (right,)) == [("200100001", "AGOMEZ")]
     assert sql("SELECT COUNT(*) FROM attendance WHERE student_id = %s", (right,))[0][0] == 1
+    report = t.get(f"/session/{sid}/report").text
+    assert "validado con la lista" in report and "<b>0</b>por revisar" in report
+
+
+def test_old_not_on_list_alerts_get_their_name_back():
+    """Alerts saved before October 27 had no student; the upgrade names them by the code typed."""
+    t = teacher()
+    sid = start(t, create_course(t, roster=ROSTER))
+    student_id = sql("SELECT id FROM students WHERE carne = '2021104567'")[0][0]
+    sql("INSERT INTO events (session_id, student_id, kind, detail, review) "
+        "VALUES (%s, NULL, 'carne_no_en_lista', '2021104567 · Safari · iOS', TRUE)", (sid,))
+    main.init_db()
+    assert sql("SELECT student_id FROM events WHERE kind = 'carne_no_en_lista'") == [(student_id,)]
