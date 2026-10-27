@@ -2110,6 +2110,7 @@ def live_state(session_id: int, request: Request):
         alerts = conn.execute("""
             SELECT ev.*, st.name FROM events ev LEFT JOIN students st ON st.id = ev.student_id
             WHERE ev.session_id = %s AND ev.review
+              AND ev.decision IS DISTINCT FROM 'validado con la lista'
             ORDER BY (ev.kind = 'rafaga'), ev.created_at DESC LIMIT 30
         """, (session_id,)).fetchall()
     return {
@@ -2738,6 +2739,10 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
                 f"{' (' + e(a['detail']) + ')' if a['detail'] else ''}{done}</li>")
     # Alerts about one student first; the general notice about many new phones
     # in a row goes after them, so it does not bury the ones that need a decision.
+    # Alerts already answered by validating with the list leave the list; they
+    # stay in the database and behind a closed "ya resueltas" line.
+    solved = [a for a in alerts if a["decision"] == "validado con la lista"]
+    alerts = [a for a in alerts if a["decision"] != "validado con la lista"]
     alert_items = "".join(alert_li(a) for a in alerts if a["kind"] != "rafaga")
     bursts = "".join(alert_li(a) for a in alerts if a["kind"] == "rafaga")
     if bursts:
@@ -2782,6 +2787,9 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
       </details>"""
     alerts_html = (f"<ul>{alert_items}</ul>" if alert_items
                    else "<p class='muted'>Nada que revisar en esta clase.</p>")
+    if solved:
+        alerts_html += (f"<details class='noprint'><summary class='hint'>Ya resueltas al validar con la "
+                        f"lista ({len(solved)})</summary><ul>{''.join(alert_li(a) for a in solved)}</ul></details>")
     ended = local(session["ended_at"]) if session["ended_at"] else "en curso"
     live_link = (f"<a class='btn' href='/session/{session_id}/live'>Volver a la pantalla en vivo</a>"
                  if session["active"] else "")
