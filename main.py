@@ -319,6 +319,18 @@ ALTER TABLE students ADD COLUMN IF NOT EXISTS consent_at TIMESTAMPTZ;
 -- The surname when the list has it in its own column, so a report can be
 -- sorted by last name the way professors read a class list.
 ALTER TABLE students ADD COLUMN IF NOT EXISTS last_name TEXT;
+-- Before October 27, "not on the list" alerts were saved without the student.
+-- Name them by the code or username they typed, and close the ones whose
+-- student is now an approved member of that class (validated with the list).
+UPDATE events ev SET student_id = st.id
+FROM students st
+WHERE ev.kind = 'carne_no_en_lista' AND ev.student_id IS NULL
+  AND split_part(ev.detail, ' · ', 1) IN (st.carne, st.username);
+UPDATE events ev SET decision = 'validado con la lista', decided_at = now(), decided_by = 'app'
+FROM sessions s, enrollments en
+WHERE ev.kind = 'carne_no_en_lista' AND ev.decision IS NULL AND ev.student_id IS NOT NULL
+  AND s.id = ev.session_id AND en.course_id = s.course_id AND en.student_id = ev.student_id
+  AND en.status = 'aprobado' AND en.section <> '';
 """
 
 
@@ -1434,6 +1446,16 @@ def validate_confirm(course_id: int, request: Request, pair: list[str] = Form(de
                              (typed, lid, typed))
             log_event(conn, None, lid, "validado_con_lista",
                       f"{typed} → {l['name']}, por {teacher['name']}")
+            # The "not on the list" alerts for this student are now answered.
+            # Older alerts were saved without the student; they are found by the
+            # code typed, which is the start of their detail.
+            conn.execute("""
+                UPDATE events SET decision = 'validado con la lista', decided_at = now(),
+                       decided_by = %s, student_id = %s
+                WHERE kind = 'carne_no_en_lista' AND decision IS NULL
+                  AND (student_id = %s OR (student_id IS NULL AND detail LIKE %s
+                       AND session_id IN (SELECT id FROM sessions WHERE course_id = %s)))
+            """, (teacher["name"], lid, lid, typed + " ·%", course_id))
             done += 1
     return RedirectResponse(f"/course/{course_id}?msg={done} estudiantes validados con la lista.",
                             status_code=303)
@@ -2506,13 +2528,15 @@ def checkin_accept(request: Request, ticket: str = Form(...),
                             "No encontramos ese carné o usuario en la lista de esta clase. "
                             "Revisa cómo lo escribiste. Si está bien, escribe también tu "
                             "nombre y quedas marcado para que el profesor lo revise."))
-                    log_event(conn, sid, student["id"] if student else None,
-                              "carne_no_en_lista", f"{carne} · {ua_text(ua)}", True, ua)
                     if student is None:
                         conn.execute("INSERT INTO students (carne, name) VALUES (%s, %s) "
                                      "ON CONFLICT (carne) DO NOTHING", (carne, nombre))
                         student = conn.execute("SELECT * FROM students WHERE carne = %s",
                                                (carne,)).fetchone()
+                    # Logged after the student exists, so the alert names them
+                    # (before October 26 it said "Varios estudiantes").
+                    log_event(conn, sid, student["id"], "carne_no_en_lista",
+                              f"{carne} · {ua_text(ua)}", True, ua)
                     conn.execute(
                         "INSERT INTO enrollments (course_id, student_id, status) "
                         "VALUES (%s, %s, 'pendiente') ON CONFLICT DO NOTHING",
@@ -2708,9 +2732,10 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
             for key, _ in REPORT_COLUMNS) + "</tr>"
         for r in rows)
     def alert_li(a):
+        done = (f" · <span class='pill ok'>{e(a['decision'])}</span>" if a["decision"] else "")
         return (f"<li>{local_time(a['created_at'])} · {e(a['name'] or 'Varios estudiantes')} · "
                 f"{e(EVENT_LABELS.get(a['kind'], a['kind']))}"
-                f"{' (' + e(a['detail']) + ')' if a['detail'] else ''}</li>")
+                f"{' (' + e(a['detail']) + ')' if a['detail'] else ''}{done}</li>")
     # Alerts about one student first; the general notice about many new phones
     # in a row goes after them, so it does not bury the ones that need a decision.
     alert_items = "".join(alert_li(a) for a in alerts if a["kind"] != "rafaga")
@@ -2796,7 +2821,7 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
         <button type="button" class="stat" onclick="filterReport('Ausente', this)"><b>{count('Ausente')}</b>ausentes</button>
         <button type="button" class="stat" onclick="filterReport('Tarde', this)"><b>{count('Tarde')}</b>llegaron después de {tarde} min</button>
         <button type="button" class="stat" onclick="filterReport('Manual', this)"><b>{count('Manual')}</b>marcados a mano</button>
-        <a class="stat" href="#por-revisar"><b>{len(alerts)}</b>por revisar</a>
+        <a class="stat" href="#por-revisar"><b>{sum(1 for a in alerts if not a['decision'] and a['kind'] != 'rafaga')}</b>por revisar</a>
         <a class="stat" href="#qr-vencido" title="Alguien escaneó un QR viejo y la app le pidió escanear otra vez."><b>{len(expired)}</b>escaneos de QR vencido</a>
       </div>
       <h2 id="por-revisar">Por revisar</h2>
