@@ -319,6 +319,9 @@ ALTER TABLE students ADD COLUMN IF NOT EXISTS consent_at TIMESTAMPTZ;
 -- The surname when the list has it in its own column, so a report can be
 -- sorted by last name the way professors read a class list.
 ALTER TABLE students ADD COLUMN IF NOT EXISTS last_name TEXT;
+-- A short note the professor writes when marking someone by hand
+-- ("llegó a las 9:10", "se le dañó el celular").
+ALTER TABLE attendance ADD COLUMN IF NOT EXISTS note TEXT;
 -- Before October 27, "not on the list" alerts were saved without the student.
 -- Name them by the code or username they typed, and close the ones whose
 -- student is now an approved member of that class (validated with the list).
@@ -2128,7 +2131,7 @@ def live_state(session_id: int, request: Request):
 
 @app.post("/session/{session_id}/manual")
 def manual_mark(session_id: int, request: Request, student_id: int = Form(0),
-                carne: str = Form(""), name: str = Form("")):
+                carne: str = Form(""), name: str = Form(""), note: str = Form("")):
     """
     For the dead battery, the phone with no data, or the student not on the
     list. Recorded as manual and as an event, so the report says who was
@@ -2163,7 +2166,10 @@ def manual_mark(session_id: int, request: Request, student_id: int = Form(0),
                 "ON CONFLICT (course_id, student_id) DO UPDATE SET status = 'aprobado'",
                 (session["course_id"], student["id"]),
             )
-        _, created = record_attendance(conn, session, student, "manual")
+        att, created = record_attendance(conn, session, student, "manual")
+        note = re.sub(r"\s+", " ", note).strip()[:200]
+        if note:
+            conn.execute("UPDATE attendance SET note = %s WHERE id = %s", (note, att["id"]))
         if created:
             log_event(conn, session_id, student["id"], "manual", f"por {teacher['name']}")
     return {"message": f"{student['name']}: {'marcado a mano' if created else 'ya estaba marcado'}."}
@@ -2654,6 +2660,8 @@ def build_report(conn, session, late_minutes: int):
         else:
             state = "Ausente"
         observation = list(dict.fromkeys(notes.get(st["id"], [])))
+        if a and a["note"]:
+            observation.insert(0, f"Nota: {a['note']}")
         if st["status"] == "pendiente":
             observation.insert(0, "Se unió marcando; falta aprobarlo")
         if groups and st["section"] and st["section"] not in groups:
@@ -2674,6 +2682,7 @@ def build_report(conn, session, late_minutes: int):
             "observacion": "; ".join(observation),
             "_apellido": _plain(f"{st['last_name']} {st['name']}" if st["last_name"] else st["name"]),
             "_llegada": a["marked_at"].timestamp() if a else None,
+            "_id": st["id"],
         })
     return rows
 
@@ -2721,7 +2730,16 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
     teacher, session, rows, alerts, expired = report_context(request, session_id, tarde)
     count = lambda state: sum(1 for r in rows if r["estado"] == state)
     present = count("Presente") + count("Tarde") + count("Manual")
-    head = "".join(f"<th>{label}</th>" for _, label in REPORT_COLUMNS)
+    head = "".join(f"<th>{label}</th>" + ("<th class='noprint'></th>" if key == "estado" else "")
+                   for key, label in REPORT_COLUMNS)
+    def action(r):
+        # A student who arrived late can be marked here, with a note, without
+        # opening the QR again just for them.
+        if r["estado"] != "Ausente":
+            return "<td class='noprint'></td>"
+        return (f"<td class='noprint' style='min-width:220px'><input class='note' placeholder='Nota (opcional)' "
+                f"maxlength='200' style='padding:4px 6px;font-size:13px'> <button class='btn small' type='button' "
+                f"onclick=\"markLate({r['_id']}, this)\">Marcar presente</button></td>")
     def sort_attrs(r):
         arrival = "" if r["_llegada"] is None else f"{r['_llegada']:.3f}"
         return (f" data-apellido='{e(r['_apellido'])}' data-nombre='{e(_plain(r['nombre']))}' "
@@ -2730,6 +2748,7 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
         f"<tr{sort_attrs(r)}>" + "".join(
             f"<td>{e(r[key])}</td>" if key != "estado" else
             f"<td><span class='pill {'bad' if r[key] in ('Ausente', 'Rechazado') else 'warn' if r[key] in ('Tarde', 'Manual') else 'ok'}'>{e(r[key])}</span></td>"
+            + (action(r) if key == "estado" else "")
             for key, _ in REPORT_COLUMNS) + "</tr>"
         for r in rows)
     def alert_li(a):
@@ -2785,6 +2804,7 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
           <p style="margin-top:10px"><button class="btn small" type="submit">Guardar grupos</button></p>
         </form>
       </details>"""
+    open_alerts = sum(1 for a in alerts if not a["decision"] and a["kind"] != "rafaga")
     alerts_html = (f"<ul>{alert_items}</ul>" if alert_items
                    else "<p class='muted'>Nada que revisar en esta clase.</p>")
     if solved:
@@ -2829,12 +2849,23 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
         <button type="button" class="stat" onclick="filterReport('Ausente', this)"><b>{count('Ausente')}</b>ausentes</button>
         <button type="button" class="stat" onclick="filterReport('Tarde', this)"><b>{count('Tarde')}</b>llegaron después de {tarde} min</button>
         <button type="button" class="stat" onclick="filterReport('Manual', this)"><b>{count('Manual')}</b>marcados a mano</button>
-        <a class="stat" href="#por-revisar"><b>{sum(1 for a in alerts if not a['decision'] and a['kind'] != 'rafaga')}</b>por revisar</a>
+        <a class="stat" href="#por-revisar" onclick="document.getElementById('por-revisar').open = true"><b>{open_alerts}</b>por revisar</a>
         <a class="stat" href="#qr-vencido" title="Alguien escaneó un QR viejo y la app le pidió escanear otra vez."><b>{len(expired)}</b>escaneos de QR vencido</a>
       </div>
-      <h2 id="por-revisar">Por revisar</h2>
-      {alerts_html}
-      <p class="hint">Estas señales son pistas, no pruebas. Si algo no cuadra, pregúntale al estudiante.</p>
+      <details id="por-revisar" open>
+        <summary style="font-size:20px;font-weight:700;margin:16px 0 8px">Por revisar ({open_alerts})</summary>
+        {alerts_html}
+        <p class="hint">Estas señales son pistas, no pruebas. Si algo no cuadra, pregúntale al estudiante.</p>
+      </details>
+      <script>
+      (function () {{
+        const box = document.getElementById('por-revisar');
+        try {{ if (localStorage.getItem('ocultarPorRevisar') === '1') box.open = false; }} catch (e) {{}}
+        box.addEventListener('toggle', () => {{
+          try {{ localStorage.setItem('ocultarPorRevisar', box.open ? '0' : '1'); }} catch (e) {{}}
+        }});
+      }})();
+      </script>
       <h2 id="qr-vencido">Escanearon un QR vencido</h2>
       {expired_html}
       <p class="hint">La app les pidió escanear otra vez. Si alguien no alcanzó a marcar y sí estaba, márcalo aquí.</p>
@@ -2842,10 +2873,12 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
       <script>
       async function markLate(id, btn) {{
         const f = new FormData(); f.append('student_id', id);
+        const box = btn.parentElement.querySelector('.note');
+        if (box) f.append('note', box.value);
         const r = await fetch('/session/{session_id}/manual', {{ method: 'POST', body: f }});
         const d = await r.json().catch(() => ({{ message: 'No se pudo marcar.' }}));
         document.getElementById('lateMsg').textContent = d.message;
-        if (r.ok) btn.replaceWith(document.createTextNode('marcado a mano'));
+        if (r.ok) location.reload();
       }}
       </script>
       <form class="noprint" method="get" style="display:flex;gap:8px;align-items:center;max-width:420px;margin-bottom:12px">
@@ -2921,7 +2954,8 @@ def export_csv(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MINU
                     headers={"Content-Disposition": f"attachment; filename={file_name(session, 'csv')}"})
 
 
-TIMING_COLUMNS = ["n", "qr_age_s", "accept_s", "first_link", "browser", "os", "in_app"]
+TIMING_COLUMNS = ["n", "seconds_since_start", "qr_age_s", "accept_s", "first_link",
+                  "browser", "os", "in_app"]
 
 
 @app.get("/session/{session_id}/timing.csv")
@@ -2936,13 +2970,16 @@ def export_timing(session_id: int, request: Request):
         teacher = require_teacher(request, conn)
         session = own_session(conn, teacher, session_id)
         rows = conn.execute(
-            "SELECT qr_age_s, accept_s, first_link, browser, os, in_app FROM attendance "
-            "WHERE session_id = %s AND method = 'qr' ORDER BY marked_at", (session_id,)).fetchall()
+            "SELECT EXTRACT(EPOCH FROM marked_at - %s::timestamptz) AS since, "
+            "qr_age_s, accept_s, first_link, browser, os, in_app FROM attendance "
+            "WHERE session_id = %s AND method = 'qr' ORDER BY marked_at",
+            (session["started_at"], session_id)).fetchall()
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     writer.writerow(TIMING_COLUMNS)
     for i, r in enumerate(rows, start=1):
-        writer.writerow([i, "" if r["qr_age_s"] is None else round(r["qr_age_s"], 2),
+        writer.writerow([i, round(float(r["since"]), 1),
+                         "" if r["qr_age_s"] is None else round(r["qr_age_s"], 2),
                          "" if r["accept_s"] is None else round(float(r["accept_s"]), 2),
                          "" if r["first_link"] is None else int(r["first_link"]),
                          r["browser"] or "", r["os"] or "", r["in_app"] or ""])
