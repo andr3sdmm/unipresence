@@ -957,7 +957,8 @@ def test_a_username_approved_by_hand_can_still_be_joined_to_its_list_row():
     assert sql("SELECT carne, username FROM students WHERE id = %s", (right,)) == [("200100001", "AGOMEZ")]
     assert sql("SELECT COUNT(*) FROM attendance WHERE student_id = %s", (right,))[0][0] == 1
     report = t.get(f"/session/{sid}/report").text
-    assert "validado con la lista" in report and "<b>0</b>por revisar" in report
+    assert "<b>0</b>por revisar" in report and "Nada que revisar en esta clase" in report
+    assert "Ya resueltas al validar con la lista (1)" in report
 
 
 def test_old_not_on_list_alerts_get_their_name_back():
