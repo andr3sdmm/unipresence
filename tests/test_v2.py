@@ -872,3 +872,87 @@ def test_projected_screen_hides_names_and_report_shows_alerts_first():
     assert "Mostrar ausentes y alertas" in page
     report = t.get(f"/session/{sid}/report").text
     assert report.index('id="por-revisar"') < report.index('id="report"')
+
+
+def test_list_with_only_codes_asks_for_the_code():
+    """Real case, 26 Oct 2026: a Banner list has codes, not usernames, so the form asks for the code."""
+    t = teacher()
+    sid = start(t, create_course(t, roster=ROSTER))
+    page = scan(student(), t, sid).text
+    assert "Código de estudiante" in page and "Carné o usuario" not in page
+    roster = ("OrgDefinedId,Last Name,First Name,Email\n"
+              "170001,GOMEZ DIAZ,ANA,agomez@universidad.edu.co\n")
+    sid2 = start(t, create_course(t, name="Con usuarios", roster=roster))
+    assert "Carné o usuario" in scan(student(), t, sid2).text
+
+
+def test_expired_scan_names_a_known_phone_and_the_professor_can_mark_after_class():
+    t = teacher()
+    sid = start(t, create_course(t, roster=ROSTER))
+    s = student()
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text),
+                                    "carne": "2021104567"})
+    t.post(f"/session/{sid}/end")
+    sid2 = start(t, sql("SELECT course_id FROM sessions WHERE id = %s", (sid,))[0][0])
+    n = fresh_nonce(t, sid2)
+    sql("UPDATE nonces SET expires_at = now() - interval '1 second' WHERE nonce = %s", (n,))
+    s.get(f"/checkin?s={sid2}&n={n}")
+    t.post(f"/session/{sid2}/end")
+    report = t.get(f"/session/{sid2}/report").text
+    assert "María Fernanda Rojas" in report and "no marcó" in report
+    student_id = sql("SELECT id FROM students WHERE carne = '2021104567'")[0][0]
+    r = t.post(f"/session/{sid2}/manual", data={"student_id": student_id}).json()
+    assert "marcado a mano" in r["message"]
+    assert "después marcó" in t.get(f"/session/{sid2}/report").text
+
+
+def test_report_lists_alerts_about_one_student_before_the_general_notice():
+    t = teacher()
+    sid = start(t, create_course(t, roster=""))
+    for i in range(3):
+        s = student(ANDROID_CHROME)
+        s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text),
+                                        "carne": f"20213000{i}", "nombre": f"Estudiante {i}"})
+    insta = student(INSTAGRAM)
+    insta.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(insta, t, sid).text),
+                                        "carne": "202130009", "nombre": "Estudiante Nueve"})
+    report = t.get(f"/session/{sid}/report").text
+    assert report.index("Abrió el enlace dentro de una app") < report.index("Avisos generales")
+
+
+def test_a_username_approved_by_hand_can_still_be_joined_to_its_list_row():
+    """Real case, 26 Oct 2026: "Aprobar" instead of "Validar" left each student twice."""
+    import html as _html
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["SPRIDEN_ID", "SPRIDEN_LAST_NAME", "SSBSECT_CRN"])
+    ws.append([200100001, "ANA GOMEZ DIAZ", 3614])
+    ws.append([200100002, "LUIS PEREZ ROA", 3614])
+    ws.append([200100003, "EVA MARIN SOTO", 3615])
+    buf = io.BytesIO(); wb.save(buf)
+    t = teacher()
+    r = t.post("/course/new", data={"name": "Sistema Nervioso"},
+               files={"roster_file": ("Listado.xlsx", buf.getvalue())})
+    payload = _html.unescape(re.search(r'name="payload" value="([^"]+)"', r.text).group(1))
+    r = t.post("/course/new/groups", follow_redirects=False,
+               data={"name": "Sistema Nervioso", "payload": payload, "sections": ["3614", "3615"]})
+    cid = int(re.search(r"/course/(\d+)", r.headers["location"]).group(1))
+    sid = int(re.search(r"/session/(\d+)/live", t.post(f"/course/{cid}/start", follow_redirects=False,
+              data={"chosen": "1", "sections": ["3614"]}).headers["location"]).group(1))
+    s = student()
+    page = s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text),
+                                           "carne": "agomez"}).text
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text),
+                                    "carne": "agomez", "nombre": "Ana Gomez"})
+    wrong = sql("SELECT id FROM students WHERE carne = 'AGOMEZ'")[0][0]
+    t.post(f"/course/{cid}/approve", data={"student_id": wrong})
+    assert sql("SELECT COUNT(*) FROM enrollments WHERE course_id = %s", (cid,))[0][0] == 4
+    assert "1 estudiantes aprobados parecen estar" in t.get(f"/course/{cid}").text
+    page = t.get(f"/course/{cid}/validar").text
+    right = sql("SELECT id FROM students WHERE carne = '200100001'")[0][0]
+    assert f"{wrong}:{right}" in page and "Luis" not in page and "Eva" not in page
+    t.post(f"/course/{cid}/validar", data={"pair": [f"{wrong}:{right}"]})
+    assert sql("SELECT COUNT(*) FROM enrollments WHERE course_id = %s", (cid,))[0][0] == 3
+    assert sql("SELECT carne, username FROM students WHERE id = %s", (right,)) == [("200100001", "AGOMEZ")]
+    assert sql("SELECT COUNT(*) FROM attendance WHERE student_id = %s", (right,))[0][0] == 1
