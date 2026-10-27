@@ -1145,6 +1145,14 @@ def course_page(course_id: int, request: Request, msg: str = "", only_history: b
                        f"grupos de hoy arriba, junto a “Tomar asistencia”. Los estudiantes que ya tienen "
                        f"asistencia no se quitan.</p><div style='display:flex;flex-wrap:wrap'>{items}</div></div></details>")
     pending_html = ""
+    with db() as conn:
+        repeated = sum(1 for p, m, _ in suggest_matches(conn, course_id)
+                       if m and p["status"] == "aprobado")
+    if repeated and not pending:
+        pending_html = f"""
+          <div class="msg warn" style="margin-top:12px">{repeated} estudiantes aprobados parecen estar
+          dos veces: una como se escribieron al marcar y otra en la lista.
+          <a class="btn small" href="/course/{course_id}/validar">Validar con la lista</a></div>"""
     validate_link = (f"<a class='btn small' href='/course/{course_id}/validar'>Validar con la lista</a>"
                      if pending and any(s["status"] == "aprobado" for s in students) else
                      "<span class='hint'>¿Tomaste asistencia sin lista? Sube la lista abajo, en "
@@ -1162,7 +1170,8 @@ def course_page(course_id: int, request: Request, msg: str = "", only_history: b
             for s in pending)
         pending_html = f"""
           <h2>Por aprobar ({len(pending)})</h2>
-          <p class="hint">Se unieron marcando asistencia. Aprueba a los que reconoces como tus estudiantes.</p>
+          <p class="hint">Se unieron marcando asistencia. Si la clase tiene lista, usa primero
+          “Validar con la lista”: une a cada uno con su fila. “Aprobar” es solo para quien no está en la lista.</p>
           <form method="post" action="/course/{course_id}/approve" class="inline">
             <input type="hidden" name="all" value="1">
             <button class="btn light small" type="submit">Aprobar a todos</button></form>
@@ -1317,8 +1326,15 @@ def suggest_matches(conn, course_id):
     rows = conn.execute(
         "SELECT st.*, en.status, en.section FROM students st JOIN enrollments en "
         "ON en.student_id = st.id WHERE en.course_id = %s", (course_id,)).fetchall()
-    listed = [r for r in rows if r["status"] == "aprobado"]
-    pending = sorted((r for r in rows if r["status"] == "pendiente"), key=lambda r: r["name"])
+    # When the list has groups, everyone who came from the list has one. An
+    # approved student with no group joined by checking in, and was approved
+    # by hand instead of validated (October 26: a username approved with
+    # "Aprobar" left the same person twice, once without a group).
+    grouped = any(r["section"] for r in rows if r["status"] == "aprobado")
+    joined = (lambda r: r["status"] == "pendiente" or
+              (grouped and r["status"] == "aprobado" and not r["section"]))
+    listed = [r for r in rows if r["status"] == "aprobado" and not joined(r)]
+    pending = sorted((r for r in rows if joined(r)), key=lambda r: r["name"])
     taken, out = set(), []
     for p in pending:
         key = normalize_carne(p["carne"])
@@ -1340,7 +1356,9 @@ def suggest_matches(conn, course_id):
             match, how = None, ""
         if match:
             taken.add(match["id"])
-        out.append((p, match, how))
+        if match or p["status"] == "pendiente":
+            # An approved student with no match is simply someone new: not shown.
+            out.append((p, match, how))
     return out
 
 
@@ -1408,6 +1426,12 @@ def validate_confirm(course_id: int, request: Request, pair: list[str] = Form(de
             merge_students(conn, wrong=p, right=l)
             if typed.isdigit() and typed != l["carne"]:
                 conn.execute("UPDATE students SET carne = %s WHERE id = %s", (typed, lid))
+            elif not typed.isdigit() and not l["username"]:
+                # The username the student typed stays as a second way in, so
+                # next time it finds them directly.
+                conn.execute("UPDATE students SET username = %s WHERE id = %s "
+                             "AND NOT EXISTS (SELECT 1 FROM students WHERE username = %s)",
+                             (typed, lid, typed))
             log_event(conn, None, lid, "validado_con_lista",
                       f"{typed} → {l['name']}, por {teacher['name']}")
             done += 1
@@ -2063,7 +2087,8 @@ def live_state(session_id: int, request: Request):
         """, (session_id,)).fetchall()
         alerts = conn.execute("""
             SELECT ev.*, st.name FROM events ev LEFT JOIN students st ON st.id = ev.student_id
-            WHERE ev.session_id = %s AND ev.review ORDER BY ev.created_at DESC LIMIT 30
+            WHERE ev.session_id = %s AND ev.review
+            ORDER BY (ev.kind = 'rafaga'), ev.created_at DESC LIMIT 30
         """, (session_id,)).fetchall()
     return {
         "active": session["active"],
@@ -2089,8 +2114,8 @@ def manual_mark(session_id: int, request: Request, student_id: int = Form(0),
     with db() as conn:
         teacher = require_teacher(request, conn)
         session = own_session(conn, teacher, session_id)
-        if not session["active"]:
-            return {"message": "Esta asistencia ya terminó."}
+        # A professor can still mark someone by hand after ending the class
+        # (from the report). Students cannot: the QR stops working.
         if student_id:
             student = conn.execute(
                 "SELECT st.* FROM students st JOIN enrollments en ON en.student_id = st.id "
@@ -2289,7 +2314,10 @@ def attendance_qr(session_id: int, request: Request):
 
 def session_for_student(conn, session_id):
     return conn.execute("""
-        SELECT s.*, c.name AS course_name, c.has_roster, t.name AS teacher_name
+        SELECT s.*, c.name AS course_name, c.has_roster, t.name AS teacher_name,
+               (c.has_roster AND NOT EXISTS (
+                   SELECT 1 FROM enrollments en JOIN students st ON st.id = en.student_id
+                   WHERE en.course_id = c.id AND st.username IS NOT NULL)) AS codes_only
         FROM sessions s JOIN courses c ON c.id = s.course_id
         JOIN teachers t ON t.id = c.teacher_id WHERE s.id = %s
     """, (session_id,)).fetchone()
@@ -2320,15 +2348,25 @@ def accept_form(session, ticket, student=None, error="", ask_name=False, carne="
     name_field = "" if session["has_roster"] and not ask_name else """
             <label for="nombre">Nombre completo</label>
             <input id="nombre" name="nombre" required maxlength="80" autocomplete="name">"""
+    # On October 26 the list came from Banner, which has student codes but no
+    # usernames, and the form asked for "carné o usuario": many students typed
+    # their username and waited as pending. When the list only has codes, the
+    # form asks for the code.
+    if session.get("codes_only"):
+        what, label, field, hint = ("tu código de estudiante", "Código de estudiante", "numeric",
+                                    "Es el número de tu carné de la universidad. No escribas tu usuario ni tu correo.")
+    else:
+        what, label, field, hint = ("tu carné o tu usuario", "Carné o usuario", "text",
+                                    "Tu usuario es lo que va antes de @ en tu correo de la universidad.")
     return student_page(f"""{head}{msg}
-      <p><strong>Primera vez en este celular.</strong> Escribe tu carné o tu usuario
+      <p><strong>Primera vez en este celular.</strong> Escribe {what}
       una sola vez; las próximas clases solo tocarás Aceptar.</p>
       <form method="post" action="/checkin/accept">
         <input type="hidden" name="ticket" value="{e(ticket)}">
-        <label for="carne">Carné o usuario</label>
-        <input id="carne" name="carne" required inputmode="text" autocapitalize="none"
+        <label for="carne">{label}</label>
+        <input id="carne" name="carne" required inputmode="{field}" autocapitalize="none"
                autocomplete="off" value="{e(carne)}" autofocus>
-        <p class="hint">Tu usuario es lo que va antes de @ en tu correo de la universidad.</p>
+        <p class="hint">{hint}</p>
         {name_field}
         <label style="display:flex;gap:10px;align-items:flex-start;margin-top:16px;font-weight:normal">
           <input type="checkbox" name="acepto" value="1" required style="width:auto;margin-top:4px">
@@ -2388,8 +2426,12 @@ def checkin(request: Request, s: int, n: str):
                                  (n, s)).fetchone()
             if nonce is None or utcnow() > nonce["expires_at"]:
                 # Counted, not flagged: how often students hit an expired code
-                # is a usability number worth reporting.
-                log_event(conn, s, None, "qr_vencido", ua_text(ua), False, ua)
+                # is a usability number worth reporting. If the phone is known,
+                # the report can say who it was and whether they marked later.
+                known = None if new_cookie else conn.execute(
+                    "SELECT id FROM students WHERE device_id = %s", (device_id,)).fetchone()
+                log_event(conn, s, known["id"] if known else None, "qr_vencido",
+                          ua_text(ua), False, ua)
                 page = rescan_page()
             else:
                 student = conn.execute("SELECT * FROM students WHERE device_id = %s",
@@ -2628,10 +2670,18 @@ def report_context(request: Request, session_id: int, late: int):
         rows = build_report(conn, session, late)
         alerts = conn.execute("""
             SELECT ev.*, st.name FROM events ev LEFT JOIN students st ON st.id = ev.student_id
-            WHERE ev.session_id = %s AND ev.review ORDER BY ev.created_at
+            WHERE ev.session_id = %s AND ev.review
+            ORDER BY (ev.kind = 'rafaga'), ev.created_at
         """, (session_id,)).fetchall()
-        expired = conn.execute("SELECT COUNT(*) AS n FROM events WHERE session_id = %s "
-                               "AND kind = 'qr_vencido'", (session_id,)).fetchone()["n"]
+        # Who scanned an expired QR, when the phone was known, and whether they
+        # managed to mark afterwards. New phones cannot be named.
+        expired = conn.execute("""
+            SELECT ev.created_at, ev.student_id, st.name,
+                   EXISTS (SELECT 1 FROM attendance a WHERE a.session_id = ev.session_id
+                           AND a.student_id = ev.student_id) AS marked
+            FROM events ev LEFT JOIN students st ON st.id = ev.student_id
+            WHERE ev.session_id = %s AND ev.kind = 'qr_vencido' ORDER BY ev.created_at
+        """, (session_id,)).fetchall()
     return teacher, session, rows, alerts, expired
 
 
@@ -2657,10 +2707,31 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
             f"<td><span class='pill {'bad' if r[key] in ('Ausente', 'Rechazado') else 'warn' if r[key] in ('Tarde', 'Manual') else 'ok'}'>{e(r[key])}</span></td>"
             for key, _ in REPORT_COLUMNS) + "</tr>"
         for r in rows)
-    alert_items = "".join(
-        f"<li>{local_time(a['created_at'])} · {e(a['name'] or 'Varios estudiantes')} · "
-        f"{e(EVENT_LABELS.get(a['kind'], a['kind']))}{' (' + e(a['detail']) + ')' if a['detail'] else ''}</li>"
-        for a in alerts)
+    def alert_li(a):
+        return (f"<li>{local_time(a['created_at'])} · {e(a['name'] or 'Varios estudiantes')} · "
+                f"{e(EVENT_LABELS.get(a['kind'], a['kind']))}"
+                f"{' (' + e(a['detail']) + ')' if a['detail'] else ''}</li>")
+    # Alerts about one student first; the general notice about many new phones
+    # in a row goes after them, so it does not bury the ones that need a decision.
+    alert_items = "".join(alert_li(a) for a in alerts if a["kind"] != "rafaga")
+    bursts = "".join(alert_li(a) for a in alerts if a["kind"] == "rafaga")
+    if bursts:
+        alert_items += ("</ul><p class='hint' style='margin:10px 0 4px'>Avisos generales "
+                        "(normales la primera vez que un grupo usa la app):</p><ul>" + bursts)
+    def expired_li(x):
+        if not x["student_id"]:
+            who = "Celular nuevo (todavía sin nombre)"
+            status = ""
+        elif x["marked"]:
+            who, status = e(x["name"]), " · <span class='pill ok'>después marcó</span>"
+        else:
+            who = e(x["name"])
+            status = (f" · <span class='pill bad'>no marcó</span> "
+                      f"<button class='btn small noprint' type='button' "
+                      f"onclick=\"markLate({x['student_id']}, this)\">Marcar presente</button>")
+        return f"<li>{local_time(x['created_at'])} · {who}{status}</li>"
+    expired_html = ("<ul>" + "".join(expired_li(x) for x in expired) + "</ul>" if expired
+                    else "<p class='muted'>Nadie escaneó un QR vencido.</p>")
     groups_line = (f"<p>Grupos de esta sesión: {e(', '.join(short_section(g) for g in session['sections']))}</p>"
                    if session["sections"] else "")
     with db() as conn:
@@ -2726,11 +2797,24 @@ def report_page(session_id: int, request: Request, tarde: int = DEFAULT_LATE_MIN
         <button type="button" class="stat" onclick="filterReport('Tarde', this)"><b>{count('Tarde')}</b>llegaron después de {tarde} min</button>
         <button type="button" class="stat" onclick="filterReport('Manual', this)"><b>{count('Manual')}</b>marcados a mano</button>
         <a class="stat" href="#por-revisar"><b>{len(alerts)}</b>por revisar</a>
-        <div class="stat" title="Alguien escaneó un QR viejo y la app le pidió escanear otra vez. No es de un estudiante en particular."><b>{expired}</b>escaneos de QR vencido</div>
+        <a class="stat" href="#qr-vencido" title="Alguien escaneó un QR viejo y la app le pidió escanear otra vez."><b>{len(expired)}</b>escaneos de QR vencido</a>
       </div>
       <h2 id="por-revisar">Por revisar</h2>
       {alerts_html}
       <p class="hint">Estas señales son pistas, no pruebas. Si algo no cuadra, pregúntale al estudiante.</p>
+      <h2 id="qr-vencido">Escanearon un QR vencido</h2>
+      {expired_html}
+      <p class="hint">La app les pidió escanear otra vez. Si alguien no alcanzó a marcar y sí estaba, márcalo aquí.</p>
+      <p id="lateMsg" class="hint"></p>
+      <script>
+      async function markLate(id, btn) {{
+        const f = new FormData(); f.append('student_id', id);
+        const r = await fetch('/session/{session_id}/manual', {{ method: 'POST', body: f }});
+        const d = await r.json().catch(() => ({{ message: 'No se pudo marcar.' }}));
+        document.getElementById('lateMsg').textContent = d.message;
+        if (r.ok) btn.replaceWith(document.createTextNode('marcado a mano'));
+      }}
+      </script>
       <form class="noprint" method="get" style="display:flex;gap:8px;align-items:center;max-width:420px;margin-bottom:12px">
         <label for="tarde" style="margin:0;white-space:nowrap">Tarde después de</label>
         <input id="tarde" name="tarde" type="number" min="0" max="240" value="{tarde}" style="width:90px">
