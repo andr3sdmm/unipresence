@@ -970,3 +970,21 @@ def test_old_not_on_list_alerts_get_their_name_back():
         "VALUES (%s, NULL, 'carne_no_en_lista', '2021104567 · Safari · iOS', TRUE)", (sid,))
     main.init_db()
     assert sql("SELECT student_id FROM events WHERE kind = 'carne_no_en_lista'") == [(student_id,)]
+
+
+def test_professor_marks_a_late_student_with_a_note_and_timing_has_seconds():
+    """A student who arrives mid-class is marked by hand with a note, without reopening the QR."""
+    t = teacher()
+    sid = start(t, create_course(t, roster=ROSTER))
+    s = student()
+    s.post("/checkin/accept", data={"acepto": "1", "ticket": ticket_of(scan(s, t, sid).text),
+                                    "carne": "2021104567"})
+    t.post(f"/session/{sid}/end")
+    report = t.get(f"/session/{sid}/report").text
+    assert report.count("Marcar presente</button>") >= 2   # the two absent students
+    juan = sql("SELECT id FROM students WHERE carne = '2021104568'")[0][0]
+    t.post(f"/session/{sid}/manual", data={"student_id": juan, "note": "Llegó a las 9:10"})
+    report = t.get(f"/session/{sid}/report").text
+    assert "Nota: Llegó a las 9:10" in report
+    rows = list(csv.DictReader(io.StringIO(t.get(f"/session/{sid}/timing.csv").text)))
+    assert len(rows) == 1 and float(rows[0]["seconds_since_start"]) >= 0
