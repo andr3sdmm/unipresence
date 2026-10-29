@@ -6,8 +6,9 @@ Inputs are the anonymous "Tiempos (anónimo)" exports (timing.csv) from the
 report page. Legitimate check-ins come from a real class; relay attempts come
 from a separate session used only for the attack protocol.
 
-    python3 analysis/relay_analysis.py --class analysis/data/tiempos_clase.csv \
-                                       --relay analysis/data/tiempos_relevo.csv
+    python3 analysis/relay_analysis.py \
+        --class analysis/data/dia11_tiempos_*.csv analysis/data/dia12_tiempos_*.csv \
+        --relay analysis/data/dia10_tiempos_relevo.csv
 
 qr_age_s is how old the QR was when the phone opened it. That is the number a
 shorter lifetime would cut. accept_s (time to tap Aceptar) is reported too,
@@ -18,7 +19,7 @@ import csv
 import statistics
 from pathlib import Path
 
-CHART = Path(__file__).parent / "relay_histogram.png"
+CHART = Path(__file__).parent.parent / "media" / "dia12_03_edad_del_qr_clase_vs_relevo.png"
 
 
 def ages(paths):
@@ -33,7 +34,7 @@ def describe(name, values):
     if not values:
         print(f"{name}: no data")
         return
-    q = statistics.quantiles(values, n=20) if len(values) > 1 else [values[0]] * 19
+    q = statistics.quantiles(values, n=20, method="inclusive") if len(values) > 1 else [values[0]] * 19
     print(f"{name}: n={len(values)}  median={statistics.median(values):.1f}s  "
           f"p90={q[17]:.1f}s  p95={q[18]:.1f}s  max={values[-1]:.1f}s")
 
@@ -58,14 +59,20 @@ def main():
     except ImportError:
         print("\n(matplotlib not installed: no chart)")
         return
-    bins = [x / 2 for x in range(0, 42)]
-    plt.hist(legit, bins=bins, alpha=0.6, label="Present students")
-    if relay:
-        plt.hist(relay, bins=bins, alpha=0.6, label="Relay attempts")
-    plt.xlabel("Age of the QR when scanned (s)")
-    plt.ylabel("Check-ins")
-    plt.legend()
-    plt.savefig(CHART, dpi=150, bbox_inches="tight")
+    fig, ax = plt.subplots(figsize=(8, 3.6), dpi=150)
+    bins = list(range(0, 22))
+    ax.hist(legit, bins=bins, color="#2a78d6", alpha=0.75, edgecolor="white",
+            label=f"Students in the room ({len(legit)})")
+    for i, v in enumerate(relay):
+        ax.axvline(v, color="#eb6834", lw=2, label="Relay attempts" if i == 0 else None)
+    ax.set_xlabel("Age of the QR when the phone opened it (s)")
+    ax.set_ylabel("Check-ins")
+    ax.set_title("A relayed QR arrives as fresh as one scanned in the room", loc="left")
+    ax.legend(frameon=False)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(CHART, bbox_inches="tight")
     print(f"\nChart: {CHART}")
 
 
