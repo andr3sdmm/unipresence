@@ -2,6 +2,8 @@
 
 Privacy-preserving physical presence verification for large classrooms.
 
+Reviewing this project? [`docs/reviewer-guide.md`](docs/reviewer-guide.md) is a short path through it.
+
 ## The problem
 
 Some Medicine courses at a university in Colombia have hundreds of students, while the university requires professors to record attendance. Calling students one by one takes a significant amount of class time, so in practice attendance is often not recorded. The professor in every pilot, who is my mother, did not take attendance in her large classes before this app: calling 88 names took 8 min 50 s when she tried it for this project.
