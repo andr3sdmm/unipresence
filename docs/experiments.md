@@ -164,3 +164,132 @@ Evidence: `media/dia09_01_qr_en_el_tiempo.png`, made by `analysis/checkin_timeli
 1. Validate the two pending students with "Validar con la lista".
 2. Upload the Banner list for this class, which has the 9-digit codes, so the code students know is found directly. A second list now updates the codes by name instead of duplicating students.
 3. The short address is.gd/asiste, so opening the page takes seconds.
+
+## Day 10 — October 25, 2026: attacking the app on purpose
+
+**What I tested:** The five attacks in `attack-protocol.md`, with real phones and a test class of three made-up students. The phone that marked in each attack never saw the laptop.
+
+| Attack | Expected | What happened |
+|---|---|---|
+| 1. Photo of an old QR | rejected | Rejected: "Ese QR ya venció" |
+| 2. Live relay over a video call | works | Worked 5 out of 5 |
+| 3. A friend's code on another phone | accepted with an alert | Accepted, and "Por revisar" showed the device change |
+| 4. A friend from your own phone | impossible | Impossible: there is no field for another code |
+| 5. The QR without being the professor | login page | Asked to log in |
+
+The relay took about 20 to 45 seconds from the start of the call to the receipt (timed roughly by hand): answering, turning the camera, pointing at the screen and scanning with a second device. But once the QR reached the phone outside, it was only 4.6 to 18.4 seconds old (measured by the server). Chrome on the iPhone was slower than Safari to open the page.
+
+**What failed:** Nothing that was expected to hold. The relay works, as expected.
+
+**What I learned:** A shorter QR does not stop a relay: the relayed QR arrives about as fresh as one scanned in the room (Day 12 compares it with 218 real check-ins). What makes the relay hard is coordination: someone outside has to be on a call, with a second device, at the exact moment the professor shows the QR.
+
+**What I decided:**
+
+1. The professor can take attendance at a moment she does not announce: at the start, ten minutes in, or at the end. It does not stop a relay, but it makes it expensive and easy to notice.
+2. No Bluetooth for now. Phone browsers on iPhone cannot use Bluetooth, so it would need an app or a beacon to buy, and the app must stay simple with nothing to install or buy. Kim, Lee and Paek (2018) also showed that a real beacon system can be faked with an Arduino.
+3. The projected screen no longer shows names: only the QR and the count. Absent students and alerts stay behind a button for the professor.
+
+Evidence: `media/dia10_01_ataque4_sin_campo_para_otro_codigo.png`, `media/dia10_02_ataque1_qr_vencido.jpg`, `media/dia10_03_ataque3_alerta_por_revisar.png`, `media/dia10_04_ataque5_pide_iniciar_sesion.jpg`, `media/dia10_05_ataque2_qr_por_videollamada.png`, `media/dia10_06_ataque2_recibo_desde_fuera.jpg`. Anonymous relay times in `analysis/data/dia10_tiempos_relevo.csv`.
+
+## Day 11 — October 26, 2026: two large classes, about 50 students each
+
+**What I tested:** Version 2.1 in two classes of the same course, in an auditorium, with the Banner list loaded and the groups chosen. Everyone was linking a phone for the first time.
+
+| | Groups 3617–3619 (8:25) | Groups 3614–3616 (10:11) |
+|---|---|---|
+| On the list | 88 | 80 |
+| Checked in with the QR | 50 | 52 |
+| First check-in after the session opened | 27 s | 14 s |
+| Checked in during the first minute | 33 | 36 |
+| Last check-in | 2 min 18 s | 2 min 57 s |
+| Time to tap Aceptar after scanning, median | 29 s | 21 s |
+| Scans of an expired QR | 6 | 12 |
+
+To start, the professor only said "vamos a llamar a lista" and showed the QR; she did not have to explain anything else. In the 8:25 class she also called the roll by hand and recorded it: 8 min 50 s in total. About 28 seconds went into finding the list, the first name came at 40 seconds, and the rest of the time was calling every name, waiting for each "presente", and then going back over the list for students who came in late. She does not normally call the roll: she did it only for this test (Day 13).
+
+The first check-in came 14 to 27 seconds after the session opened, instead of almost two minutes on October 21: the app no longer sleeps, and the professor already knew it. The slow part was the first time: typing the code and accepting the data policy took a median of 21 to 29 seconds per student.
+
+**What failed:**
+
+1. The form asked for "carné o usuario", but the Banner list only has codes. 14 students in the first class and 17 in the second typed their username and waited as pending, while their row on the list showed them absent.
+2. The pending students were approved with "Aprobar" instead of "Validar con la lista", so each of them was on the list twice (198 rows instead of 167).
+3. The "not on the list" alerts said "Varios estudiantes" instead of the name, and the notice for 31 new phones in a row buried the alerts that needed a decision.
+4. Expired scans could not say who they were, and there was no way to mark a student who arrived late with a note.
+
+**What I decided:**
+
+1. When the list only has codes, the form asks for the "Código de estudiante".
+2. "Validar con la lista" also joins students who were approved by hand, and keeps the username they typed so it works next time.
+3. Alerts name the student, alerts about one student come before general notices, and alerts already solved leave the list. "Por revisar" can be folded.
+4. The report says who scanned an expired QR and whether they marked later, and any absent student can be marked present with a note, even after class.
+
+**What this does not show:** I have not crossed the roll call with the QR name by name, so this day does not show who was in the room and did not scan. The roll call and the QR also measure different things: the roll call includes going back for late students, and the QR does not wait for them.
+
+Evidence: `media/dia11_01_qr_proyectado_auditorio.jpg`, `media/dia11_02_conteo_en_vivo.jpg`, `media/dia11_03_qr_en_el_tiempo.png` (made by `analysis/checkin_timeline.py` from the anonymous times in `analysis/data/`).
+
+## Day 12 — October 27, 2026: the same classes on their second day
+
+**What I tested:** The same two classes the next day, with the fixes from Day 11. Most students had already linked their phone, so for them checking in should be one scan and one tap.
+
+| | Groups 3617–3619 | Groups 3614–3616 |
+|---|---|---|
+| Checked in with the QR | 52 (Oct 26: 50) | 64 (Oct 26: 52) |
+| First check-in after the session opened | 12 s | 8 s |
+| Checked in during the first minute | 45 (Oct 26: 33) | 56 (Oct 26: 36) |
+| Last check-in | 2 min 8 s | 2 min 23 s |
+| Only tapped Aceptar | 30, median 3.3 s | 33, median 2.8 s |
+| Linked a phone for the first time | 22, median 11 s | 31, median 16 s |
+
+In groups 3617–3619 the professor counted about 54 students in the room, and 52 checked in. She spent about 40 seconds opening the link and explaining, and closed the QR at about 2 min 40 s. The day before, the roll call by hand in the same groups took 8 min 50 s. They are different days and the roll call also went back for late students, so this is not an exact comparison, but the difference is too large to come from that alone.
+
+A student who had already linked their phone tapped Aceptar about 3 seconds after scanning, against 21 to 29 seconds on the first day. That is the whole point of version 2: the effort is paid once.
+
+I also compared how old the QR was when each phone opened it. With 218 real check-ins from both days, the median was 8.5 seconds and 95 % were under 15 seconds. The five relays from Day 10 were 4.6 to 18.4 seconds old. A 15-second QR would let in 95 % of the students in the room and 4 of the 5 relays. No QR lifetime separates them, so I kept 20 seconds.
+
+**What failed:**
+
+1. 2 of the about 54 students the professor counted did not check in. I do not know why: the count was approximate and nobody reported a problem.
+2. 31 phones were linked for the first time in groups 3614–3616 on the second day, more than I expected. The anonymous export does not say whether they were students who missed Monday or students on a new browser.
+
+**What I decided:**
+
+1. Keep the QR at 20 seconds. Against the relay, the defence is an unannounced moment and the professor's alerts, not a shorter QR.
+2. A student from another group of the same course is marked present, with "Es de otro grupo" in the report. The summary of absences for the 25 % rule has to count that class too.
+
+Evidence: `media/dia12_01_qr_proyectado_segundo_dia.jpg`, `media/dia12_02_primer_y_segundo_dia.png` (made by `analysis/checkin_timeline.py`), `media/dia12_03_edad_del_qr_clase_vs_relevo.png` (made by `analysis/relay_analysis.py`).
+
+## Day 13 — October 28, 2026: what the professor said
+
+**What I did:** I interviewed the professor about the two large classes, with 15 questions. She answered with voice notes, in Spanish; these are her answers, translated.
+
+**What she said:**
+
+1. Before the app she did not take attendance in these classes, and no professor did, because by hand it takes too much class time. The 8 min 50 s roll call on Day 11 was the first time, only for this test.
+2. The slowest part of the QR was opening the page. She had to look for the link in our chat and type it letter by letter, because it is not easy to remember.
+3. For her, there was no difference between Monday and Tuesday, even though the students were faster on Tuesday. Her part, opening the page and waiting, did not change.
+4. She sees the alerts under "Por revisar", but does not understand what they are for or how they help her.
+5. Some students arrived as she was closing the QR and could not check in. She told them they would do it by hand at the end, but she did not find how. A student from another group (another NRC) also told her he was in her class, and she did not know how to add him.
+6. She counted heads and compared them with the count on the screen, and they usually matched. She also said that students do send the QR to classmates who are not in class, as a photo on WhatsApp or another messaging app, and that this was the complaint when other professors tried QR attendance before.
+7. Taking attendance at a moment she does not announce: "podría ser" (maybe).
+8. For the rule that more than 25 % of absences means no final exam, she wants a table, student by student, with their absences. She would enter the total number of classes, and the table would show each percentage and warn her when a student has 3, 2 or 1 absences left. With that and the QR, she would not need the paper list anymore.
+9. She would like to keep using the app, but first she needs to know how the alerts work, how to mark a student after closing the QR, and how to add a student from another group.
+10. She can ask a colleague to try it in a class.
+
+**What I learned:**
+
+1. The QR is not replacing a roll call. It is replacing no attendance at all, because nobody calls the roll in a class this size.
+2. The button to mark a late student already existed, in the report, next to each absent student. She did not find it. A feature the professor cannot find does not exist for her.
+3. The alerts were designed for me, not for her. They say what the system saw, not what she should do.
+4. Sending the QR to absent classmates is not only a theory from my threat model: she says students already do it, and not by video call, as I tested, but with a photo on WhatsApp. On October 25 I only tested a photo sent 30 seconds later, which was rejected. A photo forwarded right away is a faster relay, and I have not tested it.
+
+**What I decided:**
+
+1. Next: the absence summary she asked for, with the total of classes, the percentage and a warning at 3, 2 and 1 absences left.
+2. Show "mark a student by hand" and "add a student from another group" on the professor's screen, not only in the report.
+3. Each alert says in one sentence what she can do about it.
+4. A link that is easy to remember, saved as a bookmark on the classroom computers.
+5. Test a photo forwarded right away on WhatsApp, and measure how old the QR is when it arrives.
+6. Test a QR that changes faster. Shortening the QR alone does not work: a student with a linked phone taps Aceptar about 3 seconds after scanning, but that is after the QR was already checked. When the camera reads the QR, it is already up to 10 seconds old, because it only changes every 10 seconds. Returning students scanned a QR that was 8.4 seconds old (median), almost the same as new students (8.6 s), and with a 5-second QR only 10 of their 63 check-ins would have got in. If the QR changed every 2 or 3 seconds instead, it would always be fresh on the screen, and a shorter life might be possible. That needs a real class to check.
+7. Try the unannounced moment, and a second professor.
+
+None of these are built yet; each one will get its own day in this log when it is.

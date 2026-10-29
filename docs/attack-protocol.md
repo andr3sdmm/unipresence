@@ -67,19 +67,21 @@ These are checked on every commit, so they are not repeated by hand: a class tha
 
 ## Results
 
+Done on October 25, 2026, in a test class with three made-up students. Details in `experiments.md`, Day 10.
+
 | Attack | Expected | What happened | Evidence |
 |---|---|---|---|
-| 1. Photo of an old QR | rejected, "Ese QR ya venció" | | |
-| 2. Live relay | works | | |
-| 3. Friend's code on another phone | accepted + alert under "Por revisar" | | |
-| 4. Friend from your own phone | impossible, no code field | | |
-| 5. QR without login | login page, no image | | |
+| 1. Photo of an old QR | rejected, "Ese QR ya venció" | Rejected with that message | `media/dia10_02_ataque1_qr_vencido.jpg` |
+| 2. Live relay | works | Worked 5 out of 5 | `media/dia10_05_ataque2_qr_por_videollamada.png`, `media/dia10_06_ataque2_recibo_desde_fuera.jpg` |
+| 3. Friend's code on another phone | accepted + alert under "Por revisar" | Accepted, and "Por revisar" showed the device change | `media/dia10_03_ataque3_alerta_por_revisar.png` |
+| 4. Friend from your own phone | impossible, no code field | Only the class, the owner's name and Aceptar | `media/dia10_01_ataque4_sin_campo_para_otro_codigo.png` |
+| 5. QR without login | login page, no image | Login page, for the current id and the ones before and after | `media/dia10_04_ataque5_pide_iniciar_sesion.jpg` |
 
-For attack 2, also: attempts, how many worked, and the time from the start of the call to the receipt.
+For attack 2: 5 attempts, 5 receipts. From the start of the call to the receipt it took about 20 to 45 seconds, timed roughly by hand. The server measured how old the QR was when the phone outside opened it: 4.6 to 18.4 seconds (`analysis/data/dia10_tiempos_relevo.csv`). That is as fresh as a QR scanned inside the room, which `results.md` compares with 218 real check-ins.
 
 ## Afterwards
 
-- `threat-model.md`: replace "I have not tested this attack yet" in the live relay section with what happened.
-- `experiments.md`: a new day with what was tested, what failed and what was decided.
-- `analysis/data/`: the anonymous times of the relay attempts, next to the times of a real class.
-- `media/`: short clips or screenshots of each result. If attack 2 does not work, that does not mean the app prevents it; it only means those attempts were too slow, and the entry says so.
+- `threat-model.md`: the old QR and the live relay sections now say what happened.
+- `experiments.md`: Day 10.
+- `analysis/data/`: the anonymous times of the relay attempts, next to the times of real classes.
+- `media/`: one screenshot or photo per attack.

@@ -4,7 +4,7 @@ Privacy-preserving physical presence verification for large classrooms.
 
 ## The problem
 
-Some Medicine courses at a university in Colombia have hundreds of students, while the university requires professors to record attendance. Calling students one by one can take a significant amount of class time, so in practice attendance may not always be recorded.
+Some Medicine courses at a university in Colombia have hundreds of students, while the university requires professors to record attendance. Calling students one by one takes a significant amount of class time, so in practice attendance is often not recorded. The professor in every pilot, who is my mother, did not take attendance in her large classes before this app: calling 88 names took 8 min 50 s when she tried it for this project.
 
 The challenge is not simply digitizing an attendance list. It is verifying that a student is physically present in the classroom without collecting sensitive data such as their location.
 
@@ -51,19 +51,26 @@ Added in version 2.1, after testing with the professor's real lists:
 - Correcting a student's code or name, and deleting test sessions with their data
 - Reports that can be sorted and filtered, with an anonymous export of check-in times
 
+Added after the first large classes (October 26, 2026):
+
+- The projected screen shows only the QR and the count, no names
+- Lists that only have codes ask students for the code
+- Alerts that name the student, can be folded, and leave once they are solved
+- Marking a late student present with a note, even after class
+
 ## Results so far
 
-Two real classes in October 2026 with version 2.1: every present student checked in with the QR (20 of 20 and 15 of 15), and nobody had to be marked by hand. Once students start scanning, the whole class is in within about a minute. Whether it saves the professor time is not proven yet. The numbers, how each was measured, and what they do not show are in [`docs/results.md`](docs/results.md).
+Six real classes in October 2026 with version 2.1, from 15 to 64 students. No student was locked out by an error of the app. In a class of 88 on the list, the roll call by hand took 8 min 50 s; the QR took about 2 min 40 s from opening it to closing it. On the second day, a student whose phone was already linked tapped Aceptar about 3 seconds after scanning. The numbers, how each was measured, and what they do not show are in [`docs/results.md`](docs/results.md).
 
-![QR check-ins over time](media/dia09_01_qr_en_el_tiempo.png)
+![The same classes on their first and second day](media/dia12_02_primer_y_segundo_dia.png)
 
 ## What is not built yet
 
-- BLE-based proximity verification, which would provide stronger evidence that a device is physically inside the classroom
 - Protection against live relay attacks, such as someone sharing the current QR through a video call
 - The university's institutional authentication for professors
+- A summary of each student's absences for the course, for the rule that more than 25 % of absences means no final exam
 
-Because BLE verification is not implemented, the prototype should not be treated as proof of physical presence under every attack scenario.
+Nothing in the app proves that a phone is physically in the room, so it should not be treated as proof of presence under every attack scenario. I considered Bluetooth (BLE) and rejected it: on the iPhone it needs an app or a beacon, and the app has to work with nothing to install or buy.
 
 ## Security
 
@@ -71,7 +78,7 @@ UniPresence is designed to reduce simple forms of attendance fraud without colle
 
 Version 2 makes a deliberate trade. University codes are not secret, so a student who knows a classmate's code can move that classmate's registration to another phone. The system does not block this, because blocking is exactly what locked 7 present students out in the first pilot. Instead, every device change is recorded, counted on the teacher's screen while class runs and marked in the export. The one-phone-one-student rule is enforced by visibility rather than by refusal.
 
-Live relay remains possible. The full analysis, including vulnerabilities found during development and alternatives considered, is in [`docs/threat-model.md`](docs/threat-model.md).
+I attacked the app on purpose with real phones on October 25, 2026 ([`docs/attack-protocol.md`](docs/attack-protocol.md)). An old QR, a friend's code from your own phone and the QR without a login were all stopped; a friend's code on another phone got in with an alert. A live relay over a video call worked 5 out of 5 times, and the data shows that a shorter QR would not stop it. The full analysis, including vulnerabilities found during development and alternatives considered, is in [`docs/threat-model.md`](docs/threat-model.md).
 
 ## Running it locally
 

@@ -41,7 +41,7 @@ sequenceDiagram
     Phone->>App: camera opens /checkin?s={id}&n={nonce}
     App->>DB: does the nonce exist, and is it still valid?
     alt expired or unknown
-        App-->>Phone: "Este código ya expiró", counted for the relay analysis
+        App-->>Phone: "Ese QR ya venció", counted in the report
     else valid
         App->>DB: one-use ticket, valid 3 min, and how old the QR was
         App-->>Phone: class name + Aceptar (plus code, name and consent the first time)
@@ -108,6 +108,6 @@ What each field is, and why it is stored, is in [`data-handling.md`](data-handli
 
 ## What is not in this design
 
-- **Location or Bluetooth.** Nothing proves the phone is in the room; a live relay of the current QR still works. That is the next phase (BLE).
+- **Location or Bluetooth.** Nothing proves the phone is in the room; a live relay of the current QR still works (tested on October 25). GPS is not precise indoors and Bluetooth would need an app or a beacon, so both were rejected (`threat-model.md`, section 4).
 - **The university's login.** Professors have their own accounts.
 - **An app on the phone.** On purpose: every extra step lost students in the first pilot.
